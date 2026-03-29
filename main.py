@@ -42,43 +42,53 @@ def search_youtube(query):
 
 @bot.event
 async def on_ready():
-    print(f"✅ Bot conectado como {self.user}")
+    print(f"✅ Bot conectado como {bot.user}")
+    
+    # ← Esto es clave para evitar el error "Application command not found"
+    try:
+        synced = await bot.tree.sync()
+        print(f"✅ Comandos slash sincronizados: {len(synced)}")
+    except Exception as e:
+        print(f"⚠️ Error al sincronizar comandos: {e}")
+
     await bot.change_presence(activity=discord.Activity(
-        type=discord.ActivityType.listening, name="!play"
+        type=discord.ActivityType.listening, name="!play o /play"
     ))
 
-@bot.command(name="play")
+@bot.hybrid_command(name="play", description="Reproduce una canción")
 async def play(ctx, *, query):
-    # 1. Verificar que el usuario esté en un canal de voz
     if not ctx.author.voice:
         return await ctx.send("❌ Debes estar en un canal de voz.")
 
     await ctx.send(f"🔍 Buscando: **{query}**...")
 
-    # 2. Buscar la canción
     track = await asyncio.get_event_loop().run_in_executor(None, search_youtube, query)
     if not track:
         return await ctx.send("❌ No encontré ningún resultado.")
 
-    # 3. Conectar al canal de voz
+    # Conectar al canal de voz
     vc = ctx.voice_client
     if not vc:
         vc = await ctx.author.voice.channel.connect()
     elif vc.channel != ctx.author.voice.channel:
         await vc.move_to(ctx.author.voice.channel)
 
-    # 4. Si ya hay algo sonando, detenerlo
+    # Detener reproducción anterior si existe
     if vc.is_playing() or vc.is_paused():
         vc.stop()
 
-    # 5. Reproducir
-    vc.play(discord.FFmpegPCMAudio(track['url'], **FFMPEG_OPTS))
+    # Reproducir
+    try:
+        vc.play(discord.FFmpegPCMAudio(track['url'], **FFMPEG_OPTS))
 
-    duration = track['duration']
-    dur_str = f"{duration//60}:{duration%60:02d}" if duration else "?"
-    await ctx.send(f"▶️ Reproduciendo: **{track['title']}** `[{dur_str}]`")
+        duration = track['duration']
+        dur_str = f"{duration//60}:{duration%60:02d}" if duration else "?"
+        await ctx.send(f"▶️ Reproduciendo: **{track['title']}** `[{dur_str}]`")
+    except Exception as e:
+        print(f"Error reproduciendo: {e}")
+        await ctx.send("❌ Error al intentar reproducir la canción.")
 
-@bot.command(name="pause")
+@bot.hybrid_command(name="pause")
 async def pause(ctx):
     vc = ctx.voice_client
     if vc and vc.is_playing():
@@ -87,7 +97,7 @@ async def pause(ctx):
     else:
         await ctx.send("❌ No hay nada reproduciéndose.")
 
-@bot.command(name="resume")
+@bot.hybrid_command(name="resume")
 async def resume(ctx):
     vc = ctx.voice_client
     if vc and vc.is_paused():
@@ -96,7 +106,7 @@ async def resume(ctx):
     else:
         await ctx.send("❌ No hay nada pausado.")
 
-@bot.command(name="stop")
+@bot.hybrid_command(name="stop")
 async def stop(ctx):
     vc = ctx.voice_client
     if vc:
@@ -106,7 +116,7 @@ async def stop(ctx):
     else:
         await ctx.send("❌ No estoy en ningún canal.")
 
-@bot.command(name="skip")
+@bot.hybrid_command(name="skip")
 async def skip(ctx):
     vc = ctx.voice_client
     if vc and vc.is_playing():
