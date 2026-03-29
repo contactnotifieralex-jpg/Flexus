@@ -1,7 +1,6 @@
 FROM python:3.11-slim
 
-# ==================== INSTALACIÓN DE DEPENDENCIAS DEL SISTEMA ====================
-# Esto es lo que faltaba y lo que hace que falle el pip install
+# Instalar dependencias del sistema (necesarias para bots de música)
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
     gcc \
@@ -15,15 +14,16 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /app
 
-# Copiar requirements primero (mejora el cache de Docker)
+# === SOLUCIÓN AL ERROR ACTUAL ===
+# Copiar primero requirements.txt desde la raíz del proyecto
 COPY requirements.txt .
 
-# Actualizar pip e instalar las librerías de Python
+# Actualizar pip e instalar dependencias
 RUN pip install --no-cache-dir --upgrade pip \
     && pip install --no-cache-dir -r requirements.txt
 
-# Copiar el resto del código del bot
+# Copiar el resto del código
 COPY . .
 
-# Comando para iniciar el bot
-ENTRYPOINT ["python", "main.py"]
+# Iniciar el bot (cambia "main.py" si tu archivo principal se llama diferente)
+CMD ["python", "main.py"]
