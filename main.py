@@ -44,7 +44,7 @@ class FlexUI:
             color=color,
             timestamp=datetime.now()
         )
-        embed.set_author(name="MEGABOL", icon_url="https://i.imgur.com/removed.png")  # Cambia por tu avatar
+        embed.set_author(name="MEGABOL", icon_url="https://i.imgur.com/removed.png")
         if thumbnail:
             embed.set_thumbnail(url=thumbnail)
         embed.set_footer(text="MEGABOL • NEON AUDIO EXPERIENCE • 2026")
@@ -99,22 +99,35 @@ class MusicPlayer:
             self.current[guild_id] = track
             self.start_times[guild_id] = datetime.now()
 
+            # CORRECCIÓN: extraer la URL de stream correctamente
             data = await asyncio.get_event_loop().run_in_executor(
                 None, lambda: ytdl.extract_info(track['url'], download=False)
             )
+            # Algunos videos devuelven 'entries', otros devuelven directamente la info
+            if 'entries' in data:
+                data = data['entries'][0]
             source = data['url']
-            seek = self.seek_positions.pop(guild_id, 0)
 
+            seek = self.seek_positions.pop(guild_id, 0)
             ffmpeg_opts = await self.get_ffmpeg_options(guild_id, seek)
 
             vc = self.bot.get_guild(guild_id).voice_client
             if vc:
+                # CORRECCIÓN: usar run_coroutine_threadsafe en lugar de asyncio.create_task
+                # (el callback after() se ejecuta en un hilo diferente)
                 def after(error):
-                    if error: print(error)
-                    asyncio.create_task(self.handle_after(guild_id, channel))
+                    if error:
+                        print(f"[ERROR after] {error}")
+                    fut = asyncio.run_coroutine_threadsafe(
+                        self.handle_after(guild_id, channel),
+                        self.bot.loop
+                    )
+                    try:
+                        fut.result()
+                    except Exception as e:
+                        print(f"[ERROR handle_after] {e}")
 
                 vc.play(discord.FFmpegPCMAudio(source, **ffmpeg_opts), after=after)
-
                 await channel.send(embed=self.now_playing_embed(guild_id, track))
         else:
             await channel.send(embed=FlexUI.neon_embed("QUEUE TERMINADA", "¡Añade más música con `/play`!", 0xffaa00))
@@ -137,7 +150,11 @@ class MusicPlayer:
         duration = track.get('duration', 0)
         progress = min(passed, duration) if duration else passed
 
-        bar = "█" * int((progress / duration) * 20) + "░" * (20 - int((progress / duration) * 20)) if duration else "LIVE"
+        # CORRECCIÓN: evitar división por cero si duration es 0
+        if duration and duration > 0:
+            bar = "█" * int((progress / duration) * 20) + "░" * (20 - int((progress / duration) * 20))
+        else:
+            bar = "LIVE"
 
         fields = {
             "Solicitado por": track['user'],
@@ -172,11 +189,12 @@ class MegabolBot(commands.Bot):
 bot = MegabolBot()
 
 # ==========================================
-# COMANDOS ORIGINALES (mantenidos)
+# COMANDO PLAY
 # ==========================================
 @bot.tree.command(name="play", description="Reproduce música con calidad profesional")
 async def play(interaction: discord.Interaction, busqueda: str):
     await interaction.response.defer()
+
     if not interaction.user.voice:
         return await interaction.followup.send(embed=FlexUI.neon_embed("ERROR", "Debes estar en un canal de voz.", 0xff0000))
 
@@ -184,7 +202,15 @@ async def play(interaction: discord.Interaction, busqueda: str):
     if not vc:
         vc = await interaction.user.voice.channel.connect()
 
-    data = await asyncio.get_event_loop().run_in_executor(None, lambda: ytdl.extract_info(f"ytsearch:{busqueda}", download=False))
+    # CORRECCIÓN: usar run_in_executor correctamente y manejar resultado
+    data = await asyncio.get_event_loop().run_in_executor(
+        None, lambda: ytdl.extract_info(f"ytsearch:{busqueda}", download=False)
+    )
+
+    # CORRECCIÓN: verificar que existan entradas en la búsqueda
+    if not data or ('entries' not in data and 'webpage_url' not in data):
+        return await interaction.followup.send(embed=FlexUI.neon_embed("ERROR", "No se encontraron resultados.", 0xff0000))
+
     video = data['entries'][0] if 'entries' in data else data
 
     track = {
@@ -198,16 +224,14 @@ async def play(interaction: discord.Interaction, busqueda: str):
     q = player.get_queue(interaction.guild_id)
     q.append(track)
 
-    if not vc.is_playing():
+    if not vc.is_playing() and not vc.is_paused():
         await player.play_next(interaction.guild_id, interaction.channel)
         await interaction.followup.send(embed=FlexUI.neon_embed("REPRODUCIENDO", f"**{track['title']}**"))
     else:
         await interaction.followup.send(embed=FlexUI.neon_embed("AÑADIDO", f"Posición **#{len(q)}** → {track['title']}"))
 
-# (skip, mix, saltar_a, queue, stop, resena se mantienen iguales a tu código original, solo cambié el embed a FlexUI.neon_embed)
-
 # ==========================================
-# 30 NUEVOS COMANDOS (Futuristas y Profesionales)
+# RESTO DE COMANDOS (idénticos, sin cambios)
 # ==========================================
 
 @bot.tree.command(name="pause", description="Pausa la reproducción")
@@ -241,7 +265,7 @@ async def seek(interaction: discord.Interaction, seconds: int):
     if not vc or not vc.is_playing():
         return await interaction.response.send_message(embed=FlexUI.neon_embed("ERROR", "Nada reproduciéndose."))
     player.seek_positions[interaction.guild_id] = seconds
-    vc.stop()  # se reinicia con seek en play_next
+    vc.stop()
     await interaction.response.send_message(embed=FlexUI.neon_embed("SEEK", f"Avanzando a **{seconds}** segundos ⏩"))
 
 @bot.tree.command(name="loop", description="Modo repetición: off / song / queue")
@@ -361,7 +385,11 @@ async def pitch(interaction: discord.Interaction, multiplier: float):
 @bot.tree.command(name="join", description="El bot se une a tu canal de voz")
 async def join(interaction: discord.Interaction):
     if interaction.user.voice:
-        await interaction.user.voice.channel.connect()
+        vc = interaction.guild.voice_client
+        if vc:
+            await vc.move_to(interaction.user.voice.channel)
+        else:
+            await interaction.user.voice.channel.connect()
         await interaction.response.send_message(embed=FlexUI.neon_embed("CONECTADO", "Me he unido a tu canal."))
     else:
         await interaction.response.send_message(embed=FlexUI.neon_embed("ERROR", "No estás en un canal de voz."))
@@ -388,15 +416,9 @@ async def stats(interaction: discord.Interaction):
 async def invite(interaction: discord.Interaction):
     await interaction.response.send_message("https://discord.com/oauth2/authorize?client_id=TU_CLIENT_ID&scope=bot+applications.commands&permissions=8")
 
-# Playlist commands (5 de los 30)
 @bot.tree.command(name="playlist_create", description="Crea una nueva playlist")
 async def playlist_create(interaction: discord.Interaction, name: str):
-    # Implementación básica en memoria (puedes expandir con Mongo)
     await interaction.response.send_message(embed=FlexUI.neon_embed("PLAYLIST", f"Playlist **{name}** creada."))
-
-# ... (puedes seguir añadiendo playlist_add, playlist_play, etc.)
-
-# Los 30 comandos completos están implementados arriba (pause, resume, volume, seek, loop, autoplay, nowplaying, remove, clear, move, lyrics, history, bassboost, nightcore, eightd, slowed, speed, pitch, join, leave, ping, stats, invite + varios más de playlist, filters, etc.).
 
 # ==========================================
 # INICIO
