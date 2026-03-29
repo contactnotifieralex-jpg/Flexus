@@ -1,20 +1,15 @@
 import discord
-from discord import app_commands
 from discord.ext import commands
 import yt_dlp
 import asyncio
 import os
-from datetime import datetime
 
-# ==========================================
-# CONFIGURACIÓN
-# ==========================================
 TOKEN = os.getenv("DISCORD_TOKEN")
 
 YTDL_OPTIONS = {
     'format': 'bestaudio/best',
+    'noplaylist': True,
     'nocheckcertificate': True,
-    'ignoreerrors': False,
     'quiet': True,
     'no_warnings': True,
     'source_address': '0.0.0.0',
@@ -22,10 +17,14 @@ YTDL_OPTIONS = {
 
 FFMPEG_OPTIONS = {
     'before_options': '-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5',
-    'options': '-vn -b:a 192k',
+    'options': '-vn',
 }
 
 ytdl = yt_dlp.YoutubeDL(YTDL_OPTIONS)
+
+intents = discord.Intents.default()
+intents.message_content = True
+bot = commands.Bot(command_prefix="!", intents=intents)
 
 queues = {}
 
@@ -34,183 +33,107 @@ def get_queue(guild_id):
         queues[guild_id] = []
     return queues[guild_id]
 
-# ==========================================
-# EMBED
-# ==========================================
-def make_embed(title, description="", color=0x00f5ff, thumbnail=None):
-    embed = discord.Embed(title=f"⚡ {title} ⚡", description=description, color=color, timestamp=datetime.now())
-    embed.set_footer(text="FLEXUS • NEON AUDIO • 2026")
-    if thumbnail:
-        embed.set_thumbnail(url=thumbnail)
-    return embed
+def search_song(query):
+    """Busca la canción y devuelve la URL de stream directamente."""
+    with yt_dlp.YoutubeDL(YTDL_OPTIONS) as ydl:
+        try:
+            info = ydl.extract_info(f"ytsearch:{query}", download=False)
+            video = info['entries'][0]
+            # Obtener la URL de stream real
+            stream_info = ydl.extract_info(video['webpage_url'], download=False)
+            return {
+                'title': stream_info['title'],
+                'url': stream_info['url'],
+                'duration': stream_info.get('duration', 0),
+            }
+        except Exception as e:
+            print(f"Error buscando: {e}")
+            return None
 
-# ==========================================
-# REPRODUCCIÓN
-# ==========================================
-async def play_next(guild_id, channel, bot):
-    q = get_queue(guild_id)
-    if not q:
-        await channel.send(embed=make_embed("COLA VACÍA", "No hay más canciones. Usa `/play` para añadir más 🎵", 0xffaa00))
-        return
-
-    track = q.pop(0)
-
-    try:
-        loop = asyncio.get_event_loop()
-        data = await loop.run_in_executor(
-            None, lambda: ytdl.extract_info(track['url'], download=False)
+def play_next(ctx):
+    q = get_queue(ctx.guild.id)
+    if q:
+        track = q.pop(0)
+        source = discord.FFmpegPCMAudio(track['url'], **FFMPEG_OPTIONS)
+        ctx.voice_client.play(
+            source,
+            after=lambda e: play_next(ctx) if not e else print(f"Error: {e}")
         )
-        if 'entries' in data:
-            data = data['entries'][0]
-        stream_url = data['url']
-    except Exception as e:
-        await channel.send(embed=make_embed("ERROR", f"No pude obtener el audio: `{e}`", 0xff3355))
-        await play_next(guild_id, channel, bot)
-        return
-
-    guild = bot.get_guild(guild_id)
-    if not guild:
-        return
-    vc = guild.voice_client
-    if not vc:
-        return
-
-    def after_playing(error):
-        if error:
-            print(f"[FLEXUS ERROR] {error}")
-        asyncio.run_coroutine_threadsafe(play_next(guild_id, channel, bot), bot.loop)
-
-    vc.play(discord.FFmpegPCMAudio(stream_url, **FFMPEG_OPTIONS), after=after_playing)
-
-    duration = track.get('duration', 0)
-    dur_str = f"{duration//60}:{duration%60:02d}" if duration else "Live"
-
-    await channel.send(embed=make_embed(
-        "NOW PLAYING",
-        f"**{track['title']}**",
-        color=0x00ffcc,
-        thumbnail=track.get('thumbnail')
-    ))
-
-# ==========================================
-# BOT
-# ==========================================
-class FlexusBot(commands.Bot):
-    def __init__(self):
-        intents = discord.Intents.all()
-        super().__init__(command_prefix="!", intents=intents)
-
-    async def setup_hook(self):
-        await self.tree.sync()
-        print("✅ FLEXUS listo")
-
-    async def on_ready(self):
-        print(f"🎵 Conectado como {self.user}")
-        await self.change_presence(
-            activity=discord.Activity(type=discord.ActivityType.listening, name="/play | FLEXUS")
+        asyncio.run_coroutine_threadsafe(
+            ctx.send(f"▶️ Reproduciendo: **{track['title']}**"),
+            bot.loop
         )
 
-bot = FlexusBot()
+@bot.command(name="play", aliases=["p"])
+async def play(ctx, *, query: str):
+    # Verificar que el usuario esté en un canal de voz
+    if not ctx.author.voice:
+        return await ctx.send("❌ Debes estar en un canal de voz.")
 
-# ==========================================
-# COMANDOS
-# ==========================================
+    # Conectar al canal si no está conectado
+    if not ctx.voice_client:
+        await ctx.author.voice.channel.connect()
+    elif ctx.voice_client.channel != ctx.author.voice.channel:
+        await ctx.voice_client.move_to(ctx.author.voice.channel)
 
-@bot.tree.command(name="play", description="🎵 Reproduce una canción por nombre o URL")
-@app_commands.describe(busqueda="Nombre de la canción o URL de YouTube")
-async def play(interaction: discord.Interaction, busqueda: str):
-    await interaction.response.defer()
+    msg = await ctx.send("🔍 Buscando...")
 
-    if not interaction.user.voice:
-        return await interaction.followup.send(embed=make_embed("ERROR", "Debes estar en un canal de voz.", 0xff3355))
+    # Buscar en hilo separado para no bloquear
+    loop = asyncio.get_event_loop()
+    track = await loop.run_in_executor(None, search_song, query)
 
-    vc = interaction.guild.voice_client
-    if not vc:
-        vc = await interaction.user.voice.channel.connect()
-    elif vc.channel != interaction.user.voice.channel:
-        await vc.move_to(interaction.user.voice.channel)
+    if not track:
+        return await msg.edit(content="❌ No se encontró la canción.")
 
-    try:
-        loop = asyncio.get_event_loop()
-        query = busqueda if busqueda.startswith("http") else f"ytsearch:{busqueda}"
-        data = await loop.run_in_executor(
-            None, lambda: ytdl.extract_info(query, download=False)
-        )
-        if 'entries' in data:
-            data = data['entries'][0]
-    except Exception as e:
-        return await interaction.followup.send(embed=make_embed("ERROR", f"No encontré la canción: `{e}`", 0xff3355))
-
-    track = {
-        'url': data.get('webpage_url') or data.get('url'),
-        'title': data['title'],
-        'thumbnail': data.get('thumbnail'),
-        'duration': data.get('duration', 0),
-    }
-
-    q = get_queue(interaction.guild_id)
+    q = get_queue(ctx.guild.id)
     q.append(track)
 
-    if not vc.is_playing() and not vc.is_paused():
-        await play_next(interaction.guild_id, interaction.channel, bot)
-        await interaction.followup.send(embed=make_embed("▶ REPRODUCIENDO", f"**{track['title']}**", 0x00ffcc, track.get('thumbnail')))
+    if not ctx.voice_client.is_playing() and not ctx.voice_client.is_paused():
+        play_next(ctx)
+        await msg.edit(content=f"▶️ Reproduciendo: **{track['title']}**")
     else:
-        await interaction.followup.send(embed=make_embed("📋 AÑADIDO A LA COLA", f"**#{len(q)}** → {track['title']}", 0xb000ff, track.get('thumbnail')))
+        await msg.edit(content=f"📋 Añadido a la cola: **{track['title']}**")
 
-
-@bot.tree.command(name="skip", description="⏭ Salta la canción actual")
-async def skip(interaction: discord.Interaction):
-    vc = interaction.guild.voice_client
-    if vc and (vc.is_playing() or vc.is_paused()):
-        vc.stop()
-        await interaction.response.send_message(embed=make_embed("SKIP", "Canción saltada ⏭", 0xffaa00))
+@bot.command(name="skip", aliases=["s"])
+async def skip(ctx):
+    if ctx.voice_client and ctx.voice_client.is_playing():
+        ctx.voice_client.stop()
+        await ctx.send("⏭️ Canción saltada.")
     else:
-        await interaction.response.send_message(embed=make_embed("ERROR", "No hay nada reproduciéndose.", 0xff3355))
+        await ctx.send("❌ No hay nada reproduciéndose.")
 
-
-@bot.tree.command(name="stop", description="⏹ Para la música y limpia la cola")
-async def stop(interaction: discord.Interaction):
-    vc = interaction.guild.voice_client
-    if vc:
-        get_queue(interaction.guild_id).clear()
-        vc.stop()
-        await vc.disconnect()
-        await interaction.response.send_message(embed=make_embed("STOP", "Música detenida. ¡Hasta pronto! 👋", 0xff3355))
+@bot.command(name="stop")
+async def stop(ctx):
+    if ctx.voice_client:
+        get_queue(ctx.guild.id).clear()
+        ctx.voice_client.stop()
+        await ctx.send("⏹️ Música parada y cola limpiada.")
     else:
-        await interaction.response.send_message(embed=make_embed("ERROR", "No estoy en ningún canal.", 0xff3355))
+        await ctx.send("❌ No estoy en ningún canal.")
 
-
-@bot.tree.command(name="queue", description="📋 Muestra la cola de reproducción")
-async def queue_cmd(interaction: discord.Interaction):
-    q = get_queue(interaction.guild_id)
+@bot.command(name="queue", aliases=["q"])
+async def queue_cmd(ctx):
+    q = get_queue(ctx.guild.id)
     if not q:
-        return await interaction.response.send_message(embed=make_embed("COLA", "La cola está vacía. Usa `/play` para añadir canciones.", 0xffaa00))
-    text = "\n".join([f"**{i+1}.** {t['title'][:60]}" for i, t in enumerate(q[:10])])
-    if len(q) > 10:
-        text += f"\n*...y {len(q)-10} canciones más*"
-    await interaction.response.send_message(embed=make_embed("COLA DE REPRODUCCIÓN", text, 0x00f5ff))
+        return await ctx.send("📋 La cola está vacía.")
+    texto = "\n".join([f"**{i+1}.** {t['title']}" for i, t in enumerate(q)])
+    await ctx.send(f"📋 **Cola:**\n{texto}")
 
-
-@bot.tree.command(name="pause", description="⏸ Pausa o reanuda la reproducción")
-async def pause(interaction: discord.Interaction):
-    vc = interaction.guild.voice_client
-    if not vc:
-        return await interaction.response.send_message(embed=make_embed("ERROR", "No estoy en ningún canal.", 0xff3355))
-    if vc.is_playing():
-        vc.pause()
-        await interaction.response.send_message(embed=make_embed("PAUSA", "Reproducción pausada ⏸", 0xffaa00))
-    elif vc.is_paused():
-        vc.resume()
-        await interaction.response.send_message(embed=make_embed("REANUDADO", "▶ Reproducción reanudada", 0x00ffcc))
+@bot.command(name="leave", aliases=["dc"])
+async def leave(ctx):
+    if ctx.voice_client:
+        get_queue(ctx.guild.id).clear()
+        await ctx.voice_client.disconnect()
+        await ctx.send("👋 Desconectado.")
     else:
-        await interaction.response.send_message(embed=make_embed("ERROR", "No hay nada reproduciéndose.", 0xff3355))
+        await ctx.send("❌ No estoy en ningún canal.")
 
+@bot.event
+async def on_ready():
+    print(f"✅ Bot conectado como {bot.user}")
 
-# ==========================================
-# INICIO
-# ==========================================
 if __name__ == "__main__":
-    if not TOKEN:
-        print("❌ ERROR: Falta la variable DISCORD_TOKEN en Railway")
-    else:
+    if TOKEN:
         bot.run(TOKEN)
+    else:
+        print("❌ Falta DISCORD_TOKEN en las variables de entorno.")
