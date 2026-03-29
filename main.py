@@ -7,8 +7,8 @@ import os
 TOKEN = os.getenv("DISCORD_TOKEN")
 
 intents = discord.Intents.default()
-intents.message_content = True
 intents.voice_states = True
+intents.message_content = True
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 
@@ -17,6 +17,8 @@ YTDL_OPTS = {
     'quiet': True,
     'no_warnings': True,
     'noplaylist': True,
+    'nocheckcertificate': True,
+    'source_address': '0.0.0.0',
 }
 
 FFMPEG_OPTS = {
@@ -24,63 +26,59 @@ FFMPEG_OPTS = {
     'options': '-vn',
 }
 
+def search_youtube(query):
+    with yt_dlp.YoutubeDL(YTDL_OPTS) as ydl:
+        try:
+            info = ydl.extract_info(f"ytsearch:{query}", download=False)
+            video = info['entries'][0]
+            return {
+                'url': video['url'],
+                'title': video['title'],
+                'duration': video.get('duration', 0),
+            }
+        except Exception as e:
+            print(f"Error buscando: {e}")
+            return None
+
 @bot.event
 async def on_ready():
-    print(f"✅ Bot conectado como {bot.user}")
-    try:
-        await bot.tree.sync()   # ← Importante: sincroniza los slash commands
-        print("✅ Slash commands sincronizados")
-    except Exception as e:
-        print(f"Error sincronizando: {e}")
-
+    print(f"✅ Bot conectado como {self.user}")
     await bot.change_presence(activity=discord.Activity(
-        type=discord.ActivityType.listening, name="!play /play"
+        type=discord.ActivityType.listening, name="!play"
     ))
 
-# ←←← CAMBIO AQUÍ: hybrid_command en vez de command
-@bot.hybrid_command(name="play", description="Reproduce una canción de YouTube")
-async def play(ctx, *, query: str):
+@bot.command(name="play")
+async def play(ctx, *, query):
+    # 1. Verificar que el usuario esté en un canal de voz
     if not ctx.author.voice:
         return await ctx.send("❌ Debes estar en un canal de voz.")
 
-    await ctx.send(f"🔍 Buscando **{query}**...")
+    await ctx.send(f"🔍 Buscando: **{query}**...")
 
-    try:
-        loop = asyncio.get_event_loop()
-        with yt_dlp.YoutubeDL(YTDL_OPTS) as ydl:
-            info = await loop.run_in_executor(None, lambda: ydl.extract_info(f"ytsearch:{query}", download=False))
+    # 2. Buscar la canción
+    track = await asyncio.get_event_loop().run_in_executor(None, search_youtube, query)
+    if not track:
+        return await ctx.send("❌ No encontré ningún resultado.")
 
-        if not info or not info.get('entries'):
-            return await ctx.send("❌ No encontré resultados.")
-
-        video = info['entries'][0]
-        url = video['url']
-        title = video.get('title', 'Canción')
-
-    except Exception as e:
-        print(f"Error búsqueda: {e}")
-        return await ctx.send("❌ Error al buscar la música.")
-
-    # Conectar al canal de voz
+    # 3. Conectar al canal de voz
     vc = ctx.voice_client
     if not vc:
         vc = await ctx.author.voice.channel.connect()
     elif vc.channel != ctx.author.voice.channel:
         await vc.move_to(ctx.author.voice.channel)
 
+    # 4. Si ya hay algo sonando, detenerlo
     if vc.is_playing() or vc.is_paused():
         vc.stop()
 
-    try:
-        source = discord.FFmpegPCMAudio(url, **FFMPEG_OPTS)
-        vc.play(source)
-        await ctx.send(f"▶️ Reproduciendo: **{title}**")
-    except Exception as e:
-        print(f"Error reproduciendo: {e}")
-        await ctx.send("❌ Error al reproducir.")
+    # 5. Reproducir
+    vc.play(discord.FFmpegPCMAudio(track['url'], **FFMPEG_OPTS))
 
-# Los otros comandos también los puedes dejar como hybrid_command si quieres
-@bot.hybrid_command(name="pause")
+    duration = track['duration']
+    dur_str = f"{duration//60}:{duration%60:02d}" if duration else "?"
+    await ctx.send(f"▶️ Reproduciendo: **{track['title']}** `[{dur_str}]`")
+
+@bot.command(name="pause")
 async def pause(ctx):
     vc = ctx.voice_client
     if vc and vc.is_playing():
@@ -89,10 +87,36 @@ async def pause(ctx):
     else:
         await ctx.send("❌ No hay nada reproduciéndose.")
 
-# (repites lo mismo para resume, stop, skip...)
+@bot.command(name="resume")
+async def resume(ctx):
+    vc = ctx.voice_client
+    if vc and vc.is_paused():
+        vc.resume()
+        await ctx.send("▶️ Reanudado.")
+    else:
+        await ctx.send("❌ No hay nada pausado.")
+
+@bot.command(name="stop")
+async def stop(ctx):
+    vc = ctx.voice_client
+    if vc:
+        vc.stop()
+        await vc.disconnect()
+        await ctx.send("⏹️ Detenido y desconectado.")
+    else:
+        await ctx.send("❌ No estoy en ningún canal.")
+
+@bot.command(name="skip")
+async def skip(ctx):
+    vc = ctx.voice_client
+    if vc and vc.is_playing():
+        vc.stop()
+        await ctx.send("⏭️ Canción saltada.")
+    else:
+        await ctx.send("❌ No hay nada reproduciéndose.")
 
 if __name__ == "__main__":
     if TOKEN:
         bot.run(TOKEN)
     else:
-        print("❌ Falta DISCORD_TOKEN")
+        print("❌ Falta DISCORD_TOKEN en las variables de entorno.")
