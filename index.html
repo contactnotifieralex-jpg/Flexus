@@ -1,0 +1,102 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>FLEXUS PREMIUM - PANEL DE RESEÑAS</title>
+    <style>
+        :root {
+            --neon-blue: #00ffcc;
+            --dark-bg: #0a0a0c;
+            --frame-border: #1a1a1e;
+        }
+
+        body {
+            background-color: var(--dark-bg);
+            color: white;
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            padding: 40px;
+        }
+
+        /* DISEÑO DE FRAME IGUAL AL BOT */
+        .flex-frame {
+            border: 2px solid var(--frame-border);
+            border-left: 5px solid var(--neon-blue);
+            background: #111114;
+            padding: 20px;
+            width: 90%;
+            max-width: 600px;
+            margin-bottom: 20px;
+            box-shadow: 10px 10px 0px rgba(0, 255, 204, 0.05);
+        }
+
+        .frame-header {
+            border-bottom: 1px solid var(--frame-border);
+            margin-bottom: 15px;
+            padding-bottom: 5px;
+            font-weight: bold;
+            color: var(--neon-blue);
+            letter-spacing: 2px;
+        }
+
+        .review-card {
+            margin-bottom: 15px;
+            padding: 15px;
+            background: #16161a;
+            border-radius: 4px;
+        }
+
+        .stars { color: #f1c40f; }
+        .track-name { color: #9b59b6; font-size: 0.9em; }
+
+        h1 { text-shadow: 2px 2px var(--neon-blue); margin-bottom: 40px; }
+    </style>
+</head>
+<body>
+
+    <h1>💎 FLEXUS MUSIC LIVE</h1>
+
+    <div class="flex-frame">
+        <div class="frame-header">┏━━━━━━━━━━━━━━━━━┓<br>┃ 🎧 ÚLTIMAS RESEÑAS<br>┗━━━━━━━━━━━━━━━━━┛</div>
+        <div id="lista-resenas">
+            <p style="text-align: center; color: #666;">Esperando datos del bot...</p>
+        </div>
+    </div>
+
+    <script>
+        async function cargarResenas() {
+            try {
+                // Llama a la API que creamos en el paso anterior
+                const res = await fetch('/api/resenas');
+                const datos = await res.json();
+                
+                const contenedor = document.getElementById('lista-resenas');
+                
+                if (datos.length === 0) {
+                    contenedor.innerHTML = "<p>No hay reseñas todavía. ¡Usa el bot!</p>";
+                    return;
+                }
+
+                contenedor.innerHTML = datos.map(r => `
+                    <div class="review-card">
+                        <div><strong>👤 ${r.usuario}</strong></div>
+                        <div class="stars">${'⭐'.repeat(r.estrellas || 5)}</div>
+                        <p>"${r.mensaje}"</p>
+                        <div class="track-name">🎵 Canción: ${r.musica}</div>
+                    </div>
+                `).join('');
+
+            } catch (error) {
+                console.error("Error cargando reseñas:", error);
+            }
+        }
+
+        // Actualizar cada 10 segundos automáticamente
+        cargarResenas();
+        setInterval(cargarResenas, 10000);
+    </script>
+</body>
+</html>
