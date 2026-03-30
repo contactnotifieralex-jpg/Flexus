@@ -4,13 +4,11 @@ import asyncio
 import discord
 from discord import app_commands
 from discord.ext import commands
-from dotenv import load_dotenv
 import utils
 from autocomplete import play_autocomplete, playlists_autocomplete
 
-load_dotenv()
-
 TOKEN = os.getenv("DISCORD_TOKEN")
+
 INTENTS = discord.Intents.default()
 INTENTS.message_content = False
 
@@ -120,7 +118,6 @@ async def show_playlist(interaction: discord.Interaction, name: str):
     global_playlists = utils.load_global_playlists()
     user_playlists = utils.load_user_playlists(user_id)
 
-    # 查詢順序：全域 > 個人
     if name in global_playlists:
         song_ids = global_playlists[name]
         title = f"【{name}】"
@@ -135,7 +132,6 @@ async def show_playlist(interaction: discord.Interaction, name: str):
         await interaction.response.send_message(f"⚠️ 此歌單「{name}」沒有任何歌曲", ephemeral=True)
         return
 
-    # 分段顯示（每 20 首一段）
     PAGE_SIZE = 20
     chunks = [song_ids[i:i+PAGE_SIZE] for i in range(0, len(song_ids), PAGE_SIZE)]
 
