@@ -1,69 +1,93 @@
-import os
 import discord
 from discord.ext import commands
-from yt_dlp import YoutubeDL
+import yt_dlp
 import asyncio
+import os
+
+TOKEN = os.getenv("DISCORD_TOKEN")
 
 intents = discord.Intents.default()
 intents.message_content = True
+intents.voice_states = True
 
-bot = commands.Bot(command_prefix="!", intents=intents)
+FFMPEG_OPTIONS = {'options': '-vn'}
+YDL_OPTIONS = {'format': 'bestaudio', 'noplaylist': True}
 
-@bot.event
+class MusicBot(commands.Cog):
+    def __init__(self, client):
+        self.client = client
+        self.queue = []
+
+    @commands.command()
+    async def play(self, ctx, *, search):
+        if not ctx.author.voice:
+            return await ctx.send("❌ You're not in a voice channel!")
+
+        voice_channel = ctx.author.voice.channel
+
+        if not ctx.voice_client:
+            await voice_channel.connect()
+        elif ctx.voice_client.channel != voice_channel:
+            await ctx.voice_client.move_to(voice_channel)
+
+        async with ctx.typing():
+            try:
+                with yt_dlp.YoutubeDL(YDL_OPTIONS) as ydl:
+                    info = ydl.extract_info(f"ytsearch:{search}", download=False)
+                    if 'entries' in info:
+                        info = info['entries'][0]
+                    url = info['url']
+                    title = info['title']
+
+                self.queue.append((url, title))
+                await ctx.send(f'✅ Added to queue: **{title}**')
+
+                if not ctx.voice_client.is_playing():
+                    await self.play_next(ctx)
+            except Exception as e:
+                await ctx.send(f"❌ Error searching for song: {str(e)}")
+
+    async def play_next(self, ctx):
+        if self.queue:
+            url, title = self.queue.pop(0)
+            try:
+                source = await discord.FFmpegOpusAudio.from_probe(url, **FFMPEG_OPTIONS)
+                ctx.voice_client.play(source, after=lambda e: asyncio.create_task(self.play_next(ctx)))
+                await ctx.send(f'▶️ Now playing: **{title}**')
+            except Exception as e:
+                print(f"Error playing next: {e}")
+                await self.play_next(ctx)
+        else:
+            if ctx.voice_client:
+                await ctx.voice_client.disconnect()
+            await ctx.send("✅ Queue finished. Left the voice channel.")
+
+    @commands.command()
+    async def skip(self, ctx):
+        if ctx.voice_client and ctx.voice_client.is_playing():
+            ctx.voice_client.stop()
+            await ctx.send("⏭️ Skipped the current song.")
+        else:
+            await ctx.send("❌ Nothing is playing right now.")
+
+    @commands.command()
+    async def stop(self, ctx):
+        if ctx.voice_client:
+            await ctx.voice_client.disconnect()
+            self.queue.clear()
+            await ctx.send("⏹️ Stopped and disconnected.")
+        else:
+            await ctx.send("❌ Bot is not in a voice channel.")
+
+client = commands.Bot(command_prefix="!", intents=intents)
+
+@client.event
 async def on_ready():
-    print(f"ログインしました: {bot.user}")
+    print(f'✅ {client.user} is now online!')
 
-@bot.command()
-async def play(ctx, *, url):
-    try:
-        if ctx.author.voice is None:
-            await ctx.send("先にボイスチャンネルに入ってね")
-            return
+async def main():
+    await client.add_cog(MusicBot(client))
+    await client.start(TOKEN)
 
-        channel = ctx.author.voice.channel
-        voice = ctx.guild.voice_client
-
-        if voice is None or not voice.is_connected():
-            voice = await channel.connect()
-            await asyncio.sleep(1)
-        elif voice.channel != channel:
-            await voice.move_to(channel)
-            await asyncio.sleep(1)
-
-        if not voice.is_connected():
-            await ctx.send("ボイスチャンネルへの接続に失敗しました")
-            return
-
-        YDL_OPTIONS = {
-            "format": "bestaudio/best",
-            "quiet": True,
-            "noplaylist": True
-        }
-
-        FFMPEG_OPTIONS = {
-            "before_options": "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5",
-            "options": "-vn"
-        }
-
-        with YoutubeDL(YDL_OPTIONS) as ydl:
-            info = ydl.extract_info(url, download=False)
-            audio_url = info.get("url")
-
-        if voice.is_playing():
-            voice.stop()
-
-        source = discord.FFmpegPCMAudio(
-            audio_url,
-            executable="ffmpeg",
-            **FFMPEG_OPTIONS
-        )
-
-        voice.play(source)
-        await ctx.send("再生を開始したよ")
-
-    except Exception as e:
-        await ctx.send(f"再生中にエラーが発生しました: {e}")
-        print(e)
-
-TOKEN = os.getenv("TOKEN")
-bot.run(TOKEN)
+if __name__ == "__main__":
+    asyncio.run(main())
