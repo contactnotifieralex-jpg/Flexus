@@ -1,29 +1,29 @@
 import discord
-from discord import app_commands
 from discord.ext import commands
 import yt_dlp
 import asyncio
 import os
-import traceback
-from typing import List, Dict
 
 TOKEN = os.getenv("DISCORD_TOKEN")
+PREFIX = "!"
 
 intents = discord.Intents.default()
 intents.message_content = True
 intents.voice_states = True
 
-bot = commands.Bot(command_prefix="!", intents=intents)
+bot = commands.Bot(command_prefix=PREFIX, intents=intents)
 
-# Cola y canal de texto por servidor
-queues: Dict[int, List[dict]] = {}
-text_channels: Dict[int, discord.TextChannel] = {}
+# Cola del bot
+queue = {
+    "nowplaying": None,
+    "list": []
+}
 
 YTDL_OPTS = {
     'format': 'bestaudio/best',
     'quiet': True,
     'no_warnings': True,
-    'noplaylist': False,
+    'noplaylist': True,
     'nocheckcertificate': True,
 }
 
@@ -32,134 +32,148 @@ FFMPEG_OPTS = {
     'options': '-vn',
 }
 
-async def get_song_entries(query: str, max_results: int = 8) -> List[dict]:
-    loop = asyncio.get_event_loop()
-    def _extract():
-        with yt_dlp.YoutubeDL(YTDL_OPTS) as ydl:
-            if query.startswith(("http", "https")) and ("youtube.com" in query or "youtu.be" in query):
-                info = ydl.extract_info(query, download=False)
-                return info.get("entries", [info])[:max_results]
-            else:
-                info = ydl.extract_info(f"ytsearch{max_results}:{query}", download=False)
-                return info.get("entries", [])
-    return await loop.run_in_executor(None, _extract)
+# ==================== ACTUALIZAR ESTADO CADA 5 SEGUNDOS ====================
+async def update_status():
+    while True:
+        if queue["nowplaying"]:
+            activity = discord.Activity(type=discord.ActivityType.listening, name=queue["nowplaying"])
+        else:
+            activity = discord.Activity(type=discord.ActivityType.listening, name="!play")
+        await bot.change_presence(activity=activity)
+        await asyncio.sleep(5)
 
-# ==================== REPRODUCCIÓN GLOBAL ====================
-async def play_next(guild: discord.Guild):
-    queue = queues.get(guild.id, [])
-    if not queue:
+# ==================== REPRODUCIR SIGUIENTE ====================
+async def play_next(ctx):
+    if not queue["list"]:
+        queue["nowplaying"] = None
         return
-    track = queue.pop(0)
-    vc = guild.voice_client
+
+    query = queue["list"].pop(0)
+    queue["nowplaying"] = query
+
+    vc = ctx.voice_client
     if not vc or not vc.is_connected():
-        return
-
-    url = track.get("url")
-    title = track.get("title", "Canción")
-
-    def after(error):
-        if error:
-            print(f"[ERROR] Reproducción falló: {error}")
-        asyncio.create_task(play_next(guild))
+        vc = await ctx.author.voice.channel.connect()
 
     try:
-        vc.play(discord.FFmpegPCMAudio(url, **FFMPEG_OPTS), after=after)
-        channel = text_channels.get(guild.id)
-        if channel:
-            embed = discord.Embed(title="▶️ Ahora suena", description=f"**{title}**", color=0x1DB954)
-            await channel.send(embed=embed)
+        with yt_dlp.YoutubeDL(YTDL_OPTS) as ydl:
+            info = ydl.extract_info(f"ytsearch: {query}", download=False)
+            url = info['entries'][0]['url']
+
+        source = discord.FFmpegPCMAudio(url, **FFMPEG_OPTS)
+        vc.play(source, after=lambda e: asyncio.create_task(play_next(ctx)))
+
+        await ctx.send(f"▶️ **Reproduciendo:** {queue['nowplaying']}", delete_after=15)
     except Exception as e:
-        print(f"[ERROR] play_next falló: {e}\n{traceback.format_exc()}")
+        print(f"Error reproduciendo: {e}")
+        await ctx.send("❌ Error al reproducir la canción.", delete_after=10)
+        await play_next(ctx)
 
-# ==================== MENÚ DE SELECCIÓN ====================
-class SongSelect(discord.ui.Select):
-    def __init__(self, entries: List[dict]):
-        self.entries = entries
-        options = []
-        for i, entry in enumerate(entries):
-            title = (entry.get("title") or "Sin título")[:95]
-            dur = entry.get("duration")
-            dur_str = f"{int(dur//60)}:{int(dur%60):02d}" if dur else "LIVE"
-            uploader = (entry.get("uploader") or "")[:40]
-            options.append(discord.SelectOption(
-                label=title,
-                description=f"{dur_str} • {uploader}",
-                value=str(i),
-                emoji="🎵"
-            ))
-        super().__init__(placeholder="Elige una canción...", min_values=1, max_values=1, options=options)
+# ==================== COMANDOS ====================
+@bot.command(aliases=['p'])
+async def play(ctx, *, query=None):
+    if not ctx.author.voice or not ctx.author.voice.channel:
+        return await ctx.send("❌ Debes estar en un canal de voz.", delete_after=8)
 
-    async def callback(self, interaction: discord.Interaction):
-        try:
-            await interaction.response.defer()
-            idx = int(self.values[0])
-            track = self.entries[idx]
+    if not query:
+        return await ctx.send("❌ Debes poner un nombre o enlace de YouTube.", delete_after=8)
 
-            guild = interaction.guild
-            text_channels[guild.id] = interaction.channel
+    queue["list"].append(query)
 
-            # Añadir a cola
-            queue = queues.setdefault(guild.id, [])
-            queue.append(track)
+    if not ctx.voice_client or not ctx.voice_client.is_playing():
+        await ctx.send(f"🔍 Buscando y reproduciendo: **{query}**", delete_after=12)
+        await play_next(ctx)
+    else:
+        await ctx.send(f"➕ **{query}** añadido a la cola.", delete_after=8)
 
-            # Unirse al canal de voz
-            if not interaction.user.voice or not interaction.user.voice.channel:
-                return await interaction.followup.send("❌ Debes estar en un canal de voz.", ephemeral=True)
+@bot.command(aliases=['pa'])
+async def pause(ctx):
+    if ctx.voice_client and ctx.voice_client.is_playing():
+        ctx.voice_client.pause()
+        await ctx.send("⏸️ Música pausada.", delete_after=8)
+    else:
+        await ctx.send("❌ No hay nada reproduciéndose.", delete_after=8)
 
-            vc = guild.voice_client
-            if not vc or not vc.is_connected():
-                vc = await interaction.user.voice.channel.connect()
+@bot.command(aliases=['r'])
+async def resume(ctx):
+    if ctx.voice_client and ctx.voice_client.is_paused():
+        ctx.voice_client.resume()
+        await ctx.send("▶️ Música reanudada.", delete_after=8)
+    else:
+        await ctx.send("❌ No hay nada pausado.", delete_after=8)
 
-            # Reproducir inmediatamente si no hay nada
-            if not vc.is_playing() and not vc.is_paused():
-                await play_next(guild)
-                embed = discord.Embed(
-                    title="✅ Correcto",
-                    description=f"**{track.get('title')}**\nEl bot se ha unido al canal y está reproduciendo.",
-                    color=0x00ff00
-                )
-                await interaction.followup.send(embed=embed)
-            else:
-                await interaction.followup.send(f"✅ **{track.get('title')}** añadida a la cola.")
+@bot.command(aliases=['s'])
+async def skip(ctx):
+    if ctx.voice_client and ctx.voice_client.is_playing():
+        ctx.voice_client.stop()
+        await ctx.send("⏭️ Canción saltada.", delete_after=8)
+    else:
+        await ctx.send("❌ No hay nada reproduciéndose.", delete_after=8)
 
-        except Exception as e:
-            print(f"[ERROR] Callback de selección falló:\n{traceback.format_exc()}")
-            await interaction.followup.send("❌ Error interno al procesar la selección. Revisa los logs de Railway.", ephemeral=True)
+@bot.command(aliases=['stop', 'end'])
+async def stop(ctx):
+    if ctx.voice_client:
+        queue["list"] = []
+        queue["nowplaying"] = None
+        ctx.voice_client.stop()
+        await ctx.voice_client.disconnect()
+        await ctx.send("⏹️ Música detenida y desconectado.", delete_after=10)
+    else:
+        await ctx.send("❌ No estoy en ningún canal.", delete_after=8)
 
-class SongSelectView(discord.ui.View):
-    def __init__(self, entries: List[dict]):
-        super().__init__(timeout=180)
-        self.add_item(SongSelect(entries))
+@bot.command(aliases=['q'])
+async def queue(ctx):
+    if not queue["list"] and not queue["nowplaying"]:
+        return await ctx.send("❌ La cola está vacía.", delete_after=10)
 
-# ==================== COMANDO /play ====================
-@bot.tree.command(name="play", description="Busca y reproduce música de YouTube")
-@app_commands.describe(query="Nombre de la canción o enlace de YouTube")
-async def play(interaction: discord.Interaction, query: str):
-    await interaction.response.defer(thinking=True)
+    qtext = "\n".join([f"{i+1}. {song}" for i, song in enumerate(queue["list"])]) or "No hay más canciones en cola."
+    await ctx.send(f"**📋 Cola actual:**\n\nAhora: **{queue['nowplaying'] or 'Nada'}**\n\n{qtext}", delete_after=30)
 
-    if not interaction.user.voice or not interaction.user.voice.channel:
-        return await interaction.followup.send("❌ Debes estar en un canal de voz.")
+@bot.command(aliases=['now', 'song'])
+async def now(ctx):
+    if queue["nowplaying"]:
+        await ctx.send(f"🎵 **Ahora suena:** {queue['nowplaying']}", delete_after=15)
+    else:
+        await ctx.send("❌ No hay ninguna canción reproduciéndose.", delete_after=8)
 
-    await interaction.followup.send(f"🔍 Buscando **{query}**...")
-    entries = await get_song_entries(query)
+@bot.command(aliases=['v'])
+async def volume(ctx, vol: int = None):
+    if not ctx.voice_client:
+        return await ctx.send("❌ No estoy en un canal de voz.", delete_after=8)
 
-    if not entries:
-        return await interaction.followup.send("❌ No encontré resultados.")
+    if vol is None:
+        return await ctx.send(f"🔊 Volumen actual: **{int(ctx.voice_client.source.volume * 100)}%**", delete_after=10)
 
-    view = SongSelectView(entries)
-    embed = discord.Embed(title="🎵 Resultados de búsqueda", description=f"**{query}**\nElige una:", color=0x1DB954)
-    await interaction.followup.send(embed=embed, view=view)
+    if 0 <= vol <= 200:
+        ctx.voice_client.source.volume = vol / 100
+        await ctx.send(f"🔊 Volumen cambiado a: **{vol}%**", delete_after=8)
+    else:
+        await ctx.send("❌ El volumen debe estar entre 0 y 200.", delete_after=8)
 
-# Comandos básicos (pause, resume, stop, skip) se mantienen como antes
-# (puedes copiarlos de la versión anterior si los quieres)
+@bot.command(aliases=['cq'])
+async def clear_queue(ctx):
+    queue["list"] = []
+    await ctx.send("🗑️ Cola limpiada.", delete_after=8)
 
+# ==================== EVENTOS ====================
 @bot.event
 async def on_ready():
-    synced = await bot.tree.sync()
-    print(f"✅ Bot conectado como {bot.user} | {len(synced)} comandos slash sincronizados")
+    print(f"""
+    <---------------------------------------->
+    Bot iniciado como: {bot.user}
+    Prefijo: {PREFIX}
+    <---------------------------------------->
+    """)
+    bot.loop.create_task(update_status())
+
+@bot.event
+async def on_message(message):
+    if message.author.bot:
+        return
+    await bot.process_commands(message)
 
 if __name__ == "__main__":
     if TOKEN:
         bot.run(TOKEN)
     else:
-        print("❌ Falta DISCORD_TOKEN")
+        print("❌ Falta DISCORD_TOKEN en las variables de Railway")
