@@ -4,6 +4,7 @@ from discord.ext import commands
 import yt_dlp
 import asyncio
 import os
+import traceback
 from typing import List, Dict
 
 TOKEN = os.getenv("DISCORD_TOKEN")
@@ -14,6 +15,7 @@ intents.voice_states = True
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 
+# Cola y canal de texto por servidor
 queues: Dict[int, List[dict]] = {}
 text_channels: Dict[int, discord.TextChannel] = {}
 
@@ -23,7 +25,6 @@ YTDL_OPTS = {
     'no_warnings': True,
     'noplaylist': False,
     'nocheckcertificate': True,
-    'source_address': '0.0.0.0',
 }
 
 FFMPEG_OPTS = {
@@ -43,41 +44,65 @@ async def get_song_entries(query: str, max_results: int = 8) -> List[dict]:
                 return info.get("entries", [])
     return await loop.run_in_executor(None, _extract)
 
+# ==================== REPRODUCCIÓN GLOBAL ====================
+async def play_next(guild: discord.Guild):
+    queue = queues.get(guild.id, [])
+    if not queue:
+        return
+    track = queue.pop(0)
+    vc = guild.voice_client
+    if not vc or not vc.is_connected():
+        return
 
+    url = track.get("url")
+    title = track.get("title", "Canción")
+
+    def after(error):
+        if error:
+            print(f"[ERROR] Reproducción falló: {error}")
+        asyncio.create_task(play_next(guild))
+
+    try:
+        vc.play(discord.FFmpegPCMAudio(url, **FFMPEG_OPTS), after=after)
+        channel = text_channels.get(guild.id)
+        if channel:
+            embed = discord.Embed(title="▶️ Ahora suena", description=f"**{title}**", color=0x1DB954)
+            await channel.send(embed=embed)
+    except Exception as e:
+        print(f"[ERROR] play_next falló: {e}\n{traceback.format_exc()}")
+
+# ==================== MENÚ DE SELECCIÓN ====================
 class SongSelect(discord.ui.Select):
     def __init__(self, entries: List[dict]):
         self.entries = entries
         options = []
         for i, entry in enumerate(entries):
             title = (entry.get("title") or "Sin título")[:95]
-            duration = entry.get("duration")
-            dur_str = f"{int(duration//60)}:{int(duration%60):02d}" if duration else "LIVE"
-            uploader = (entry.get("uploader") or "Desconocido")[:40]
-            options.append(
-                discord.SelectOption(
-                    label=title,
-                    description=f"{dur_str} • {uploader}",
-                    value=str(i),
-                    emoji="🎵"
-                )
-            )
+            dur = entry.get("duration")
+            dur_str = f"{int(dur//60)}:{int(dur%60):02d}" if dur else "LIVE"
+            uploader = (entry.get("uploader") or "")[:40]
+            options.append(discord.SelectOption(
+                label=title,
+                description=f"{dur_str} • {uploader}",
+                value=str(i),
+                emoji="🎵"
+            ))
         super().__init__(placeholder="Elige una canción...", min_values=1, max_values=1, options=options)
 
     async def callback(self, interaction: discord.Interaction):
         try:
             await interaction.response.defer()
-            selected_idx = int(self.values[0])
-            track = self.entries[selected_idx]
+            idx = int(self.values[0])
+            track = self.entries[idx]
 
             guild = interaction.guild
-            if not guild:
-                return
-
             text_channels[guild.id] = interaction.channel
 
+            # Añadir a cola
             queue = queues.setdefault(guild.id, [])
             queue.append(track)
 
+            # Unirse al canal de voz
             if not interaction.user.voice or not interaction.user.voice.channel:
                 return await interaction.followup.send("❌ Debes estar en un canal de voz.", ephemeral=True)
 
@@ -85,56 +110,30 @@ class SongSelect(discord.ui.Select):
             if not vc or not vc.is_connected():
                 vc = await interaction.user.voice.channel.connect()
 
-            # Reproducir si no hay nada sonando
+            # Reproducir inmediatamente si no hay nada
             if not vc.is_playing() and not vc.is_paused():
-                await self.play_next(guild)
-                embed = discord.Embed(title="▶️ Reproduciendo ahora", description=f"**{track.get('title')}**", color=0x00ff00)
+                await play_next(guild)
+                embed = discord.Embed(
+                    title="✅ Correcto",
+                    description=f"**{track.get('title')}**\nEl bot se ha unido al canal y está reproduciendo.",
+                    color=0x00ff00
+                )
                 await interaction.followup.send(embed=embed)
             else:
                 await interaction.followup.send(f"✅ **{track.get('title')}** añadida a la cola.")
 
         except Exception as e:
-            print(f"❌ Error en Select callback: {e}")
-            try:
-                await interaction.followup.send("❌ Ocurrió un error al procesar la selección.", ephemeral=True)
-            except:
-                pass
-
-    async def play_next(self, guild: discord.Guild):
-        queue = queues.get(guild.id, [])
-        if not queue:
-            return
-        track = queue.pop(0)
-        vc = guild.voice_client
-        if not vc or not vc.is_connected():
-            return
-
-        url = track.get("url")
-        title = track.get("title", "Canción")
-
-        def after_play(error):
-            if error:
-                print(f"Error reproduciendo: {error}")
-            asyncio.create_task(self.play_next(guild))
-
-        try:
-            vc.play(discord.FFmpegPCMAudio(url, **FFMPEG_OPTS), after=after_play)
-            channel = text_channels.get(guild.id)
-            if channel:
-                embed = discord.Embed(title="▶️ Ahora suena", description=f"**{title}**", color=0x1DB954)
-                await channel.send(embed=embed)
-        except Exception as e:
-            print(f"Error al reproducir {title}: {e}")
-
+            print(f"[ERROR] Callback de selección falló:\n{traceback.format_exc()}")
+            await interaction.followup.send("❌ Error interno al procesar la selección. Revisa los logs de Railway.", ephemeral=True)
 
 class SongSelectView(discord.ui.View):
     def __init__(self, entries: List[dict]):
         super().__init__(timeout=180)
         self.add_item(SongSelect(entries))
 
-
-@bot.tree.command(name="play", description="Busca y reproduce música con selección")
-@app_commands.describe(query="Nombre o enlace de YouTube")
+# ==================== COMANDO /play ====================
+@bot.tree.command(name="play", description="Busca y reproduce música de YouTube")
+@app_commands.describe(query="Nombre de la canción o enlace de YouTube")
 async def play(interaction: discord.Interaction, query: str):
     await interaction.response.defer(thinking=True)
 
@@ -148,25 +147,16 @@ async def play(interaction: discord.Interaction, query: str):
         return await interaction.followup.send("❌ No encontré resultados.")
 
     view = SongSelectView(entries)
-    embed = discord.Embed(
-        title="🎵 Resultados de búsqueda",
-        description=f"**{query}**\nElige una canción:",
-        color=0x1DB954
-    )
+    embed = discord.Embed(title="🎵 Resultados de búsqueda", description=f"**{query}**\nElige una:", color=0x1DB954)
     await interaction.followup.send(embed=embed, view=view)
 
-
-# Comandos básicos (pause, resume, stop, skip) se mantienen iguales que antes
-
+# Comandos básicos (pause, resume, stop, skip) se mantienen como antes
+# (puedes copiarlos de la versión anterior si los quieres)
 
 @bot.event
 async def on_ready():
-    try:
-        synced = await bot.tree.sync()
-        print(f"✅ Bot conectado como {bot.user} | {len(synced)} comandos sincronizados")
-    except Exception as e:
-        print(f"Error sincronizando: {e}")
-
+    synced = await bot.tree.sync()
+    print(f"✅ Bot conectado como {bot.user} | {len(synced)} comandos slash sincronizados")
 
 if __name__ == "__main__":
     if TOKEN:
