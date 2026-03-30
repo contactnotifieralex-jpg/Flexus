@@ -13,7 +13,6 @@ intents.voice_states = True
 
 bot = commands.Bot(command_prefix=PREFIX, intents=intents)
 
-# Cola por servidor
 queues = {}  # guild_id: {"queue": [], "nowplaying": None}
 
 YTDL_OPTS = {
@@ -44,30 +43,26 @@ async def play_next(ctx):
 
     try:
         with yt_dlp.YoutubeDL(YTDL_OPTS) as ydl:
-            info = ydl.extract_info(f"ytsearch:{query}" if not query.startswith("http") else query, download=False)
+            info = ydl.extract_info(f"ytsearch:{query}" if not query.startswith(("http://", "https://")) else query, download=False)
             url = info['entries'][0]['url'] if 'entries' in info else info['url']
             title = info['entries'][0]['title'] if 'entries' in info else info['title']
-            thumbnail = info['entries'][0].get('thumbnail') if 'entries' in info else info.get('thumbnail')
 
         source = discord.FFmpegPCMAudio(url, **FFMPEG_OPTS)
         vc.play(source, after=lambda e: asyncio.create_task(play_next(ctx)))
 
         embed = discord.Embed(title="🔊 Reproduciendo ahora", description=title, color=0x1DB954)
-        embed.set_thumbnail(url=thumbnail)
         await ctx.send(embed=embed)
     except Exception as e:
         print(f"Error reproduciendo: {e}")
-        await ctx.send("❌ Error al reproducir.", delete_after=10)
+        await ctx.send("❌ Error al reproducir la canción.", delete_after=10)
         await play_next(ctx)
 
 
-@bot.command(aliases=['p'])
-async def play(ctx, *, query: str = None):
+# ==================== COMANDOS HÍBRIDOS ====================
+@bot.hybrid_command(name="play", description="Reproduce una canción o la añade a la cola")
+async def play(ctx, *, query: str):
     if not ctx.author.voice or not ctx.author.voice.channel:
         return await ctx.send("❌ Necesitas unirte a un canal de voz!")
-
-    if not query:
-        return await ctx.send("❌ No escribiste el nombre de ninguna canción.")
 
     guild_id = ctx.guild.id
     if guild_id not in queues:
@@ -79,10 +74,10 @@ async def play(ctx, *, query: str = None):
         await ctx.send(f"🔍 Buscando: **{query}**")
         await play_next(ctx)
     else:
-        await ctx.send(f"📢 Has añadido **{query}** a la cola.")
+        await ctx.send(f"📢 **{query}** añadido a la cola.")
 
 
-@bot.command()
+@bot.hybrid_command(name="skip", description="Salta la canción actual")
 async def skip(ctx):
     if ctx.voice_client and ctx.voice_client.is_playing():
         ctx.voice_client.stop()
@@ -91,7 +86,7 @@ async def skip(ctx):
         await ctx.send("❌ No hay canción reproduciéndose.")
 
 
-@bot.command(aliases=['cola'])
+@bot.hybrid_command(name="cola", description="Muestra la cola de canciones")
 async def queue(ctx):
     guild_id = ctx.guild.id
     if guild_id not in queues or not queues[guild_id]["queue"]:
@@ -101,7 +96,7 @@ async def queue(ctx):
     await ctx.send(f"```css\n📋 Cola actual:\n\nAhora: {queues[guild_id]['nowplaying'] or 'Nada'}\n\n{q}\n```")
 
 
-@bot.command(aliases=['salir'])
+@bot.hybrid_command(name="salir", description="Saca el bot del canal de voz")
 async def leave(ctx):
     if ctx.voice_client:
         await ctx.voice_client.disconnect()
@@ -113,7 +108,7 @@ async def leave(ctx):
         await ctx.send("❌ No estoy en ningún canal de voz.")
 
 
-@bot.command(aliases=['pausa'])
+@bot.hybrid_command(name="pausa", description="Pausa la canción actual")
 async def pause(ctx):
     if ctx.voice_client and ctx.voice_client.is_playing():
         ctx.voice_client.pause()
@@ -122,7 +117,7 @@ async def pause(ctx):
         await ctx.send("❌ No hay nada reproduciéndose.")
 
 
-@bot.command()
+@bot.hybrid_command(name="resume", description="Reanuda la canción pausada")
 async def resume(ctx):
     if ctx.voice_client and ctx.voice_client.is_paused():
         ctx.voice_client.resume()
@@ -131,7 +126,7 @@ async def resume(ctx):
         await ctx.send("❌ No hay nada pausado.")
 
 
-@bot.command(aliases=['comandos'])
+@bot.hybrid_command(name="comandos", description="Lista de comandos disponibles")
 async def help_cmd(ctx):
     await ctx.send(
         "📜 **Lista de comandos:**\n"
@@ -149,6 +144,12 @@ async def help_cmd(ctx):
 
 @bot.event
 async def on_ready():
+    try:
+        synced = await bot.tree.sync()
+        print(f"✅ Bot conectado como {bot.user} | {len(synced)} comandos slash sincronizados")
+    except Exception as e:
+        print(f"Error sincronizando comandos: {e}")
+
     print(f"""
     <---------------------------------------->
     Bot iniciado como: {bot.user}
@@ -162,4 +163,4 @@ if __name__ == "__main__":
     if TOKEN:
         bot.run(TOKEN)
     else:
-        print("❌ Falta DISCORD_TOKEN en Railway")
+        print("❌ Falta DISCORD_TOKEN en las variables de Railway")
