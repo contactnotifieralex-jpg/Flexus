@@ -1,444 +1,555 @@
 import discord
 from discord import app_commands, ui
 from discord.ext import commands
+import yt_dlp
 import asyncio
 import os
-from datetime import datetime, timedelta
+from datetime import datetime
 
 TOKEN = os.getenv("DISCORD_TOKEN")
 
-intents = discord.Intents.all()
+intents = discord.Intents.default()
+intents.voice_states = True
+intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 # ==========================================
-# BASE DE DATOS EN MEMORIA
+# YT-DLP CONFIG
 # ==========================================
-# ping_rules[guild_id][victim_id] = {"action": "warn"/"mute"/"ban"/"nothing", "protected_users": [id1, id2]}
-ping_rules = {}
-# warnings[guild_id][user_id] = count
-warnings = {}
+SEARCH_OPTS = {
+    'format': 'bestaudio/best',
+    'quiet': True,
+    'no_warnings': True,
+    'noplaylist': True,
+    'nocheckcertificate': True,
+    'source_address': '0.0.0.0',
+    'extract_flat': True,   # rápido para buscar sin descargar
+}
+
+STREAM_OPTS = {
+    'format': 'bestaudio/best',
+    'quiet': True,
+    'no_warnings': True,
+    'noplaylist': True,
+    'nocheckcertificate': True,
+    'source_address': '0.0.0.0',
+}
+
+FFMPEG_OPTS = {
+    'before_options': '-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5',
+    'options': '-vn -b:a 192k',
+}
+
+def format_duration(seconds):
+    if not seconds:
+        return "🔴 Live"
+    h = seconds // 3600
+    m = (seconds % 3600) // 60
+    s = seconds % 60
+    if h:
+        return f"{h}:{m:02d}:{s:02d}"
+    return f"{m}:{s:02d}"
+
+def search_tracks(query):
+    """Busca 5 resultados en YouTube."""
+    is_url = query.startswith("http://") or query.startswith("https://")
+    with yt_dlp.YoutubeDL(SEARCH_OPTS) as ydl:
+        if is_url:
+            info = ydl.extract_info(query, download=False)
+            entries = [info] if 'entries' not in info else info['entries'][:5]
+        else:
+            info = ydl.extract_info(f"ytsearch5:{query}", download=False)
+            entries = info.get('entries', [])
+    results = []
+    for e in entries[:5]:
+        if not e:
+            continue
+        results.append({
+            'title': e.get('title', 'Sin título'),
+            'url': e.get('webpage_url') or e.get('url', ''),
+            'duration': e.get('duration', 0),
+            'channel': e.get('uploader') or e.get('channel', 'Desconocido'),
+            'thumbnail': e.get('thumbnail', ''),
+            'views': e.get('view_count', 0),
+        })
+    return results
+
+def get_stream_url(webpage_url):
+    """Obtiene la URL de stream de audio real."""
+    with yt_dlp.YoutubeDL(STREAM_OPTS) as ydl:
+        info = ydl.extract_info(webpage_url, download=False)
+        return info['url'], info
 
 # ==========================================
-# HELPERS
+# ESTADO DEL PLAYER POR SERVIDOR
 # ==========================================
-def get_ping_rule(guild_id, victim_id):
-    return ping_rules.get(guild_id, {}).get(victim_id)
+class GuildPlayer:
+    def __init__(self):
+        self.queue = []
+        self.current = None
+        self.loop = False
+        self.volume = 1.0
+        self.start_time = None
+        self.text_channel = None
 
-def add_warning(guild_id, user_id):
-    if guild_id not in warnings:
-        warnings[guild_id] = {}
-    warnings[guild_id][user_id] = warnings[guild_id].get(user_id, 0) + 1
-    return warnings[guild_id][user_id]
+players = {}  # guild_id -> GuildPlayer
+
+def get_player(guild_id):
+    if guild_id not in players:
+        players[guild_id] = GuildPlayer()
+    return players[guild_id]
 
 # ==========================================
-# PANEL 1 - ELEGIR CASTIGO
+# AFTER CALLBACK — siguiente canción
 # ==========================================
-class PunishmentSelect(ui.Select):
-    def __init__(self, setup_state):
-        self.setup_state = setup_state
-        options = [
-            discord.SelectOption(label="Nada", value="nothing", emoji="✅", description="No hacer nada cuando te hagan ping"),
-            discord.SelectOption(label="Advertencia", value="warn", emoji="⚠️", description="El usuario recibe una advertencia"),
-            discord.SelectOption(label="Silenciar 5 min", value="mute", emoji="🔇", description="El usuario es silenciado 5 minutos"),
-            discord.SelectOption(label="Ban permanente", value="ban", emoji="🔨", description="El usuario es baneado del servidor"),
-        ]
-        super().__init__(placeholder="Elige el castigo para quien te haga ping...", options=options, min_values=1, max_values=1)
+def play_next_after(guild_id, bot_ref):
+    async def _next():
+        gp = get_player(guild_id)
+        guild = bot_ref.get_guild(guild_id)
+        if not guild:
+            return
+        vc = guild.voice_client
+        if not vc:
+            return
+
+        if gp.loop and gp.current:
+            gp.queue.insert(0, gp.current)
+
+        if not gp.queue:
+            gp.current = None
+            if gp.text_channel:
+                embed = discord.Embed(
+                    title="✅ Cola vacía",
+                    description="No hay más canciones en la cola.\nUsa `/play` para añadir más música.",
+                    color=0x5865F2,
+                    timestamp=datetime.now()
+                )
+                embed.set_footer(text="FLEXUS MUSIC")
+                await gp.text_channel.send(embed=embed)
+            return
+
+        track = gp.queue.pop(0)
+        gp.current = track
+        gp.start_time = datetime.now()
+
+        try:
+            stream_url, _ = await asyncio.get_event_loop().run_in_executor(
+                None, get_stream_url, track['url']
+            )
+        except Exception as e:
+            if gp.text_channel:
+                await gp.text_channel.send(f"❌ Error al reproducir **{track['title']}**: {e}")
+            await _next()
+            return
+
+        source = discord.PCMVolumeTransformer(
+            discord.FFmpegPCMAudio(stream_url, **FFMPEG_OPTS),
+            volume=gp.volume
+        )
+
+        def after(error):
+            if error:
+                print(f"[FLEXUS] Error: {error}")
+            asyncio.run_coroutine_threadsafe(_next(), bot_ref.loop)
+
+        vc.play(source, after=after)
+
+        if gp.text_channel:
+            embed = now_playing_embed(track, gp)
+            await gp.text_channel.send(embed=embed)
+
+    return _next
+
+def now_playing_embed(track, gp: GuildPlayer):
+    dur = format_duration(track.get('duration', 0))
+    views = track.get('views', 0)
+    views_str = f"{views:,}".replace(",", ".") if views else "?"
+
+    embed = discord.Embed(
+        title="▶️  NOW PLAYING",
+        description=f"## [{track['title']}]({track['url']})",
+        color=0x1DB954,
+        timestamp=datetime.now()
+    )
+    if track.get('thumbnail'):
+        embed.set_image(url=track['thumbnail'])
+    embed.add_field(name="⏱️ Duración", value=f"`{dur}`", inline=True)
+    embed.add_field(name="📺 Canal", value=track.get('channel', '?'), inline=True)
+    embed.add_field(name="👁️ Vistas", value=views_str, inline=True)
+    embed.add_field(name="🔁 Loop", value="✅ Sí" if gp.loop else "❌ No", inline=True)
+    embed.add_field(name="🔊 Volumen", value=f"{int(gp.volume * 100)}%", inline=True)
+    embed.add_field(name="📋 En cola", value=str(len(gp.queue)), inline=True)
+    embed.set_footer(text="FLEXUS MUSIC  •  Neon Audio Experience")
+    return embed
+
+# ==========================================
+# SELECT MENU — elegir canción
+# ==========================================
+class SongSelectMenu(ui.Select):
+    def __init__(self, results, voice_channel, guild_id, requester):
+        self.results = results
+        self.voice_channel = voice_channel
+        self.guild_id = guild_id
+        self.requester = requester
+
+        options = []
+        for i, track in enumerate(results):
+            dur = format_duration(track.get('duration', 0))
+            label = track['title'][:95]
+            desc = f"{track['channel'][:40]}  •  {dur}"
+            options.append(discord.SelectOption(
+                label=label,
+                description=desc,
+                value=str(i),
+                emoji=["1️⃣","2️⃣","3️⃣","4️⃣","5️⃣"][i]
+            ))
+
+        super().__init__(
+            placeholder="🎵  Elige la canción que quieres escuchar...",
+            options=options,
+            min_values=1,
+            max_values=1
+        )
 
     async def callback(self, interaction: discord.Interaction):
-        self.setup_state["action"] = self.values[0]
-        labels = {"nothing": "✅ Nada", "warn": "⚠️ Advertencia", "mute": "🔇 Silenciado 5 min", "ban": "🔨 Ban permanente"}
-        embed = discord.Embed(
-            title="⚙️ SETUP — Paso 2 de 2",
-            description=(
-                f"**Castigo seleccionado:** {labels[self.values[0]]}\n\n"
-                "Ahora menciona en el cuadro de texto a los usuarios que quieres **proteger**.\n"
-                "Escribe sus menciones en el chat y pulsa **Confirmar**.\n\n"
-                "Ejemplo: `@pepe @ana @luis`"
-            ),
-            color=0x5865F2
-        )
-        embed.set_footer(text="FLEXUS GUARD • Sistema de protección de pings")
-        view = ProtectedUsersView(self.setup_state, interaction.user.id, interaction.guild)
-        await interaction.response.edit_message(embed=embed, view=view)
+        if interaction.user.id != self.requester.id:
+            return await interaction.response.send_message(
+                "❌ Solo quien buscó puede elegir.", ephemeral=True
+            )
 
-class PunishmentView(ui.View):
-    def __init__(self, setup_state):
-        super().__init__(timeout=120)
-        self.add_item(PunishmentSelect(setup_state))
+        await interaction.response.defer()
+        idx = int(self.values[0])
+        track = self.results[idx]
+        gp = get_player(self.guild_id)
+        gp.text_channel = interaction.channel
+
+        # Conectar al canal de voz
+        guild = interaction.guild
+        vc = guild.voice_client
+
+        try:
+            if not vc:
+                vc = await self.voice_channel.connect()
+            elif vc.channel.id != self.voice_channel.id:
+                await vc.move_to(self.voice_channel)
+        except Exception as e:
+            return await interaction.followup.send(f"❌ No pude conectarme al canal de voz: {e}")
+
+        # Obtener stream URL (con loading embed)
+        loading_embed = discord.Embed(
+            title="⏳ Cargando canción...",
+            description=f"**{track['title']}**\nObteniendo audio, espera un momento...",
+            color=0xffaa00
+        )
+        await interaction.edit_original_response(embed=loading_embed, view=None)
+
+        try:
+            stream_url, full_info = await asyncio.get_event_loop().run_in_executor(
+                None, get_stream_url, track['url']
+            )
+            # Actualizar con info completa
+            track['duration'] = full_info.get('duration', track.get('duration', 0))
+            track['views'] = full_info.get('view_count', 0)
+            track['thumbnail'] = full_info.get('thumbnail', track.get('thumbnail', ''))
+            track['channel'] = full_info.get('uploader') or full_info.get('channel', track.get('channel', ''))
+        except Exception as e:
+            return await interaction.followup.send(f"❌ Error obteniendo el audio: {e}")
+
+        # Si ya está reproduciendo, añadir a cola
+        if vc.is_playing() or vc.is_paused():
+            gp.queue.append(track)
+            embed = discord.Embed(
+                title="📋 Añadido a la cola",
+                description=f"**[{track['title']}]({track['url']})**",
+                color=0x5865F2,
+                timestamp=datetime.now()
+            )
+            embed.add_field(name="⏱️ Duración", value=f"`{format_duration(track['duration'])}`", inline=True)
+            embed.add_field(name="📋 Posición en cola", value=f"**#{len(gp.queue)}**", inline=True)
+            if track.get('thumbnail'):
+                embed.set_thumbnail(url=track['thumbnail'])
+            embed.set_footer(text="FLEXUS MUSIC")
+            await interaction.edit_original_response(embed=embed, view=None)
+            return
+
+        # Reproducir directamente
+        gp.current = track
+        gp.start_time = datetime.now()
+
+        source = discord.PCMVolumeTransformer(
+            discord.FFmpegPCMAudio(stream_url, **FFMPEG_OPTS),
+            volume=gp.volume
+        )
+
+        def after(error):
+            if error:
+                print(f"[FLEXUS] Error playback: {error}")
+            coro = play_next_after(self.guild_id, interaction.client)()
+            asyncio.run_coroutine_threadsafe(coro, interaction.client.loop)
+
+        vc.play(source, after=after)
+
+        embed = now_playing_embed(track, gp)
+        await interaction.edit_original_response(embed=embed, view=None)
+
+
+class SongSelectView(ui.View):
+    def __init__(self, results, voice_channel, guild_id, requester):
+        super().__init__(timeout=60)
+        self.add_item(SongSelectMenu(results, voice_channel, guild_id, requester))
+
+        cancel = ui.Button(label="Cancelar", style=discord.ButtonStyle.danger, emoji="✖️", row=1)
+        async def cancel_cb(interaction: discord.Interaction):
+            embed = discord.Embed(title="❌ Búsqueda cancelada", color=0xff4444)
+            await interaction.response.edit_message(embed=embed, view=None)
+            self.stop()
+        cancel.callback = cancel_cb
+        self.add_item(cancel)
 
     async def on_timeout(self):
         pass
 
 # ==========================================
-# PANEL 2 - ELEGIR USUARIOS PROTEGIDOS
+# COMANDOS
 # ==========================================
-class ProtectedUsersView(ui.View):
-    def __init__(self, setup_state, owner_id, guild):
-        super().__init__(timeout=120)
-        self.setup_state = setup_state
-        self.owner_id = owner_id
-        self.guild = guild
 
-    @ui.button(label="Confirmar selección", style=discord.ButtonStyle.success, emoji="✔️")
-    async def confirm(self, interaction: discord.Interaction, button: ui.Button):
-        if interaction.user.id != self.owner_id:
-            return await interaction.response.send_message("❌ Solo quien ejecutó /setup puede confirmar.", ephemeral=True)
+@bot.tree.command(name="play", description="🎵 Busca una canción o pega un enlace de YouTube")
+@app_commands.describe(busqueda="Nombre de la canción o URL de YouTube")
+async def play(interaction: discord.Interaction, busqueda: str):
+    await interaction.response.defer()
 
-        # Buscar menciones en los últimos mensajes del canal
-        protected = []
-        async for msg in interaction.channel.history(limit=10):
-            if msg.author.id == self.owner_id and msg.mentions:
-                for member in msg.mentions:
-                    if member.id not in protected:
-                        protected.append(member.id)
-                break
-
-        action = self.setup_state.get("action", "nothing")
-        victim_id = self.owner_id
-
-        if interaction.guild.id not in ping_rules:
-            ping_rules[interaction.guild.id] = {}
-
-        ping_rules[interaction.guild.id][victim_id] = {
-            "action": action,
-            "protected_users": protected
-        }
-
-        labels = {"nothing": "✅ Nada", "warn": "⚠️ Advertencia", "mute": "🔇 Silenciado 5 min", "ban": "🔨 Ban permanente"}
-        protected_mentions = " ".join([f"<@{uid}>" for uid in protected]) if protected else "*(todos los usuarios)*"
-
+    if not interaction.user.voice:
         embed = discord.Embed(
-            title="✅ Protección activada",
-            color=0x00ff88,
-            timestamp=datetime.now()
+            title="❌ No estás en un canal de voz",
+            description="Únete a un canal de voz primero y vuelve a intentarlo.",
+            color=0xff4444
         )
-        embed.add_field(name="🛡️ Usuario protegido", value=f"<@{victim_id}>", inline=True)
-        embed.add_field(name="⚡ Castigo", value=labels[action], inline=True)
-        embed.add_field(name="👥 Se aplica a", value=protected_mentions, inline=False)
-        embed.set_footer(text="FLEXUS GUARD • Protección activa")
-        await interaction.response.edit_message(embed=embed, view=None)
+        return await interaction.followup.send(embed=embed)
 
-    @ui.button(label="Proteger de TODOS", style=discord.ButtonStyle.danger, emoji="🌐")
-    async def protect_all(self, interaction: discord.Interaction, button: ui.Button):
-        if interaction.user.id != self.owner_id:
-            return await interaction.response.send_message("❌ Solo quien ejecutó /setup puede confirmar.", ephemeral=True)
+    # Buscar canciones
+    searching_embed = discord.Embed(
+        title="🔍 Buscando...",
+        description=f"Buscando resultados para:\n**{busqueda}**",
+        color=0xffaa00
+    )
+    await interaction.followup.send(embed=searching_embed)
 
-        action = self.setup_state.get("action", "nothing")
-        victim_id = self.owner_id
+    try:
+        results = await asyncio.get_event_loop().run_in_executor(None, search_tracks, busqueda)
+    except Exception as e:
+        embed = discord.Embed(title="❌ Error en la búsqueda", description=str(e), color=0xff4444)
+        return await interaction.edit_original_response(embed=embed)
 
-        if interaction.guild.id not in ping_rules:
-            ping_rules[interaction.guild.id] = {}
-
-        # Lista vacía = aplica a todos
-        ping_rules[interaction.guild.id][victim_id] = {
-            "action": action,
-            "protected_users": []
-        }
-
-        labels = {"nothing": "✅ Nada", "warn": "⚠️ Advertencia", "mute": "🔇 Silenciado 5 min", "ban": "🔨 Ban permanente"}
-
+    if not results:
         embed = discord.Embed(
-            title="✅ Protección total activada",
-            description=f"**Cualquier usuario** que te haga ping recibirá: **{labels[action]}**",
-            color=0xff4444,
-            timestamp=datetime.now()
+            title="❌ Sin resultados",
+            description=f"No encontré nada para **{busqueda}**.\nIntenta con otro nombre o un enlace directo.",
+            color=0xff4444
         )
-        embed.set_footer(text="FLEXUS GUARD • Protección total activa")
-        await interaction.response.edit_message(embed=embed, view=None)
+        return await interaction.edit_original_response(embed=embed)
 
-# ==========================================
-# EVENTO — DETECTAR PINGS
-# ==========================================
-@bot.event
-async def on_message(message):
-    if message.author.bot:
-        await bot.process_commands(message)
-        return
+    # Mostrar resultados
+    desc = ""
+    for i, track in enumerate(results):
+        emoji = ["1️⃣","2️⃣","3️⃣","4️⃣","5️⃣"][i]
+        dur = format_duration(track.get('duration', 0))
+        desc += f"{emoji} **{track['title'][:60]}**\n"
+        desc += f"   `{track['channel'][:35]}` · `{dur}`\n\n"
 
-    guild_id = message.guild.id if message.guild else None
-    if guild_id and message.mentions:
-        guild_rules = ping_rules.get(guild_id, {})
-        for victim in message.mentions:
-            if victim.id == message.author.id:
-                continue  # ignorar auto-pings
-            rule = guild_rules.get(victim.id)
-            if not rule:
-                continue
-
-            protected = rule["protected_users"]
-            # Si la lista está vacía protege de todos, si tiene IDs solo de esos
-            if protected and message.author.id not in protected:
-                continue
-
-            action = rule["action"]
-            pinger = message.author
-
-            if action == "nothing":
-                pass
-
-            elif action == "warn":
-                count = add_warning(guild_id, pinger.id)
-                try:
-                    embed = discord.Embed(
-                        title="⚠️ ADVERTENCIA",
-                        description=(
-                            f"{pinger.mention} has recibido una advertencia por hacer ping a {victim.mention}.\n"
-                            f"**Total de advertencias:** {count}"
-                        ),
-                        color=0xffaa00,
-                        timestamp=datetime.now()
-                    )
-                    await message.channel.send(embed=embed)
-                except Exception as e:
-                    print(f"Error warn: {e}")
-
-            elif action == "mute":
-                try:
-                    until = datetime.utcnow() + timedelta(minutes=5)
-                    await pinger.timeout(until, reason=f"Ping no autorizado a {victim.display_name}")
-                    embed = discord.Embed(
-                        title="🔇 SILENCIADO",
-                        description=f"{pinger.mention} ha sido silenciado **5 minutos** por hacer ping a {victim.mention}.",
-                        color=0xff6600,
-                        timestamp=datetime.now()
-                    )
-                    await message.channel.send(embed=embed)
-                except discord.Forbidden:
-                    await message.channel.send("❌ No tengo permisos para silenciar a ese usuario.")
-                except Exception as e:
-                    print(f"Error mute: {e}")
-
-            elif action == "ban":
-                try:
-                    embed = discord.Embed(
-                        title="🔨 BAN",
-                        description=f"{pinger.mention} ha sido **baneado** por hacer ping a {victim.mention}.",
-                        color=0xff0000,
-                        timestamp=datetime.now()
-                    )
-                    await message.channel.send(embed=embed)
-                    await asyncio.sleep(1)
-                    await pinger.ban(reason=f"Ping no autorizado a {victim.display_name}")
-                except discord.Forbidden:
-                    await message.channel.send("❌ No tengo permisos para banear a ese usuario.")
-                except Exception as e:
-                    print(f"Error ban: {e}")
-
-    await bot.process_commands(message)
-
-# ==========================================
-# COMANDO PRINCIPAL — /setup
-# ==========================================
-@bot.tree.command(name="setup", description="🛡️ Configura la protección de pings para ti")
-async def setup(interaction: discord.Interaction):
-    setup_state = {}
     embed = discord.Embed(
-        title="⚙️ SETUP — Paso 1 de 2",
-        description=(
-            "**Bienvenido al sistema de protección de pings.**\n\n"
-            "Cuando alguien te mencione (`@tú`), el bot ejecutará automáticamente el castigo que elijas.\n\n"
-            "**Paso 1:** Selecciona qué castigo quieres aplicar:"
-        ),
-        color=0x5865F2,
+        title="🎵 Resultados de búsqueda",
+        description=desc,
+        color=0x1DB954,
         timestamp=datetime.now()
     )
-    embed.add_field(name="✅ Nada", value="No pasa nada", inline=True)
-    embed.add_field(name="⚠️ Advertencia", value="Aviso público", inline=True)
-    embed.add_field(name="🔇 Silenciar 5 min", value="Timeout automático", inline=True)
-    embed.add_field(name="🔨 Ban", value="Ban permanente", inline=True)
-    embed.set_footer(text="FLEXUS GUARD • Configura tu protección")
-    view = PunishmentView(setup_state)
-    await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
+    embed.set_footer(text="FLEXUS MUSIC  •  Selecciona una canción del menú  •  Expira en 60s")
 
-# ==========================================
-# COMANDO — /miproteccion
-# ==========================================
-@bot.tree.command(name="miproteccion", description="🔍 Ver tu configuración de protección actual")
-async def miproteccion(interaction: discord.Interaction):
-    rule = ping_rules.get(interaction.guild_id, {}).get(interaction.user.id)
-    if not rule:
+    view = SongSelectView(
+        results=results,
+        voice_channel=interaction.user.voice.channel,
+        guild_id=interaction.guild_id,
+        requester=interaction.user
+    )
+    await interaction.edit_original_response(embed=embed, view=view)
+
+
+@bot.tree.command(name="skip", description="⏭️ Salta la canción actual")
+async def skip(interaction: discord.Interaction):
+    vc = interaction.guild.voice_client
+    if not vc or not (vc.is_playing() or vc.is_paused()):
         return await interaction.response.send_message(
-            embed=discord.Embed(title="❌ Sin protección", description="No tienes ninguna protección configurada. Usa `/setup`.", color=0xff4444),
-            ephemeral=True
+            embed=discord.Embed(title="❌ Nada reproduciéndose", color=0xff4444), ephemeral=True
         )
-    labels = {"nothing": "✅ Nada", "warn": "⚠️ Advertencia", "mute": "🔇 Silenciado 5 min", "ban": "🔨 Ban permanente"}
-    protected = rule["protected_users"]
-    protected_text = " ".join([f"<@{uid}>" for uid in protected]) if protected else "🌐 Todos los usuarios"
-    embed = discord.Embed(title="🛡️ Tu protección activa", color=0x5865F2, timestamp=datetime.now())
-    embed.add_field(name="⚡ Castigo configurado", value=labels[rule["action"]], inline=True)
-    embed.add_field(name="👥 Aplica a", value=protected_text, inline=False)
-    embed.set_footer(text="FLEXUS GUARD")
-    await interaction.response.send_message(embed=embed, ephemeral=True)
+    vc.stop()
+    await interaction.response.send_message(
+        embed=discord.Embed(title="⏭️ Canción saltada", color=0x5865F2, timestamp=datetime.now())
+    )
 
-# ==========================================
-# COMANDO — /quitarproteccion
-# ==========================================
-@bot.tree.command(name="quitarproteccion", description="🗑️ Elimina tu protección de pings")
-async def quitarproteccion(interaction: discord.Interaction):
-    if interaction.guild_id in ping_rules and interaction.user.id in ping_rules[interaction.guild_id]:
-        del ping_rules[interaction.guild_id][interaction.user.id]
+
+@bot.tree.command(name="pause", description="⏸️ Pausa la reproducción")
+async def pause(interaction: discord.Interaction):
+    vc = interaction.guild.voice_client
+    if vc and vc.is_playing():
+        vc.pause()
         await interaction.response.send_message(
-            embed=discord.Embed(title="🗑️ Protección eliminada", description="Tu protección ha sido desactivada.", color=0xffaa00),
-            ephemeral=True
+            embed=discord.Embed(title="⏸️ Pausado", color=0xffaa00, timestamp=datetime.now())
         )
     else:
         await interaction.response.send_message(
-            embed=discord.Embed(title="❌ Sin protección", description="No tenías ninguna protección activa.", color=0xff4444),
-            ephemeral=True
+            embed=discord.Embed(title="❌ Nada reproduciéndose", color=0xff4444), ephemeral=True
         )
 
-# ==========================================
-# COMANDO — /advertencias
-# ==========================================
-@bot.tree.command(name="advertencias", description="📋 Ver las advertencias de un usuario")
-@app_commands.describe(usuario="Usuario del que ver las advertencias")
-async def advertencias(interaction: discord.Interaction, usuario: discord.Member):
-    count = warnings.get(interaction.guild_id, {}).get(usuario.id, 0)
-    embed = discord.Embed(
-        title="📋 Advertencias",
-        description=f"{usuario.mention} tiene **{count}** advertencia(s).",
-        color=0xffaa00 if count > 0 else 0x00ff88,
-        timestamp=datetime.now()
-    )
-    await interaction.response.send_message(embed=embed)
 
-# ==========================================
-# COMANDO — /limpiaradvertencias
-# ==========================================
-@bot.tree.command(name="limpiaradvertencias", description="🧹 Limpia las advertencias de un usuario (solo admins)")
-@app_commands.describe(usuario="Usuario al que limpiar advertencias")
-async def limpiaradvertencias(interaction: discord.Interaction, usuario: discord.Member):
-    if not interaction.user.guild_permissions.administrator:
-        return await interaction.response.send_message("❌ Solo los administradores pueden usar este comando.", ephemeral=True)
-    if interaction.guild_id in warnings and usuario.id in warnings[interaction.guild_id]:
-        warnings[interaction.guild_id][usuario.id] = 0
-    embed = discord.Embed(
-        title="🧹 Advertencias limpiadas",
-        description=f"Las advertencias de {usuario.mention} han sido reiniciadas a 0.",
-        color=0x00ff88,
-        timestamp=datetime.now()
-    )
-    await interaction.response.send_message(embed=embed)
-
-# ==========================================
-# COMANDO — /userinfo
-# ==========================================
-@bot.tree.command(name="userinfo", description="👤 Información detallada de un usuario")
-@app_commands.describe(usuario="Usuario del que ver la información")
-async def userinfo(interaction: discord.Interaction, usuario: discord.Member = None):
-    usuario = usuario or interaction.user
-    roles = [r.mention for r in usuario.roles if r.name != "@everyone"]
-    embed = discord.Embed(title=f"👤 {usuario.display_name}", color=usuario.color, timestamp=datetime.now())
-    embed.set_thumbnail(url=usuario.display_avatar.url)
-    embed.add_field(name="🆔 ID", value=f"`{usuario.id}`", inline=True)
-    embed.add_field(name="📅 Cuenta creada", value=f"<t:{int(usuario.created_at.timestamp())}:R>", inline=True)
-    embed.add_field(name="📥 Entró al servidor", value=f"<t:{int(usuario.joined_at.timestamp())}:R>", inline=True)
-    embed.add_field(name="🤖 Bot", value="Sí" if usuario.bot else "No", inline=True)
-    embed.add_field(name=f"🎭 Roles ({len(roles)})", value=" ".join(roles[:5]) if roles else "Ninguno", inline=False)
-    warns = warnings.get(interaction.guild_id, {}).get(usuario.id, 0)
-    embed.add_field(name="⚠️ Advertencias", value=str(warns), inline=True)
-    rule = ping_rules.get(interaction.guild_id, {}).get(usuario.id)
-    embed.add_field(name="🛡️ Protección", value="✅ Activa" if rule else "❌ Inactiva", inline=True)
-    embed.set_footer(text=f"Solicitado por {interaction.user.display_name}")
-    await interaction.response.send_message(embed=embed)
-
-# ==========================================
-# COMANDO — /serverinfo
-# ==========================================
-@bot.tree.command(name="serverinfo", description="🏠 Información del servidor")
-async def serverinfo(interaction: discord.Interaction):
-    g = interaction.guild
-    embed = discord.Embed(title=f"🏠 {g.name}", color=0x5865F2, timestamp=datetime.now())
-    if g.icon:
-        embed.set_thumbnail(url=g.icon.url)
-    embed.add_field(name="🆔 ID", value=f"`{g.id}`", inline=True)
-    embed.add_field(name="👑 Dueño", value=f"<@{g.owner_id}>", inline=True)
-    embed.add_field(name="📅 Creado", value=f"<t:{int(g.created_at.timestamp())}:R>", inline=True)
-    embed.add_field(name="👥 Miembros", value=str(g.member_count), inline=True)
-    embed.add_field(name="💬 Canales", value=str(len(g.channels)), inline=True)
-    embed.add_field(name="🎭 Roles", value=str(len(g.roles)), inline=True)
-    embed.add_field(name="😀 Emojis", value=str(len(g.emojis)), inline=True)
-    embed.add_field(name="🔒 Verificación", value=str(g.verification_level).capitalize(), inline=True)
-    protecciones = sum(1 for v in ping_rules.get(g.id, {}).values() if v)
-    embed.add_field(name="🛡️ Protecciones activas", value=str(protecciones), inline=True)
-    await interaction.response.send_message(embed=embed)
-
-# ==========================================
-# COMANDO — /silenciar (admin)
-# ==========================================
-@bot.tree.command(name="silenciar", description="🔇 Silencia a un usuario (solo admins)")
-@app_commands.describe(usuario="Usuario a silenciar", minutos="Duración en minutos", razon="Razón del silencio")
-async def silenciar(interaction: discord.Interaction, usuario: discord.Member, minutos: int = 5, razon: str = "Sin razón especificada"):
-    if not interaction.user.guild_permissions.moderate_members:
-        return await interaction.response.send_message("❌ No tienes permisos para silenciar.", ephemeral=True)
-    try:
-        until = datetime.utcnow() + timedelta(minutes=minutos)
-        await usuario.timeout(until, reason=razon)
-        embed = discord.Embed(
-            title="🔇 Usuario silenciado",
-            color=0xff6600,
-            timestamp=datetime.now()
+@bot.tree.command(name="resume", description="▶️ Reanuda la reproducción")
+async def resume(interaction: discord.Interaction):
+    vc = interaction.guild.voice_client
+    if vc and vc.is_paused():
+        vc.resume()
+        await interaction.response.send_message(
+            embed=discord.Embed(title="▶️ Reanudado", color=0x1DB954, timestamp=datetime.now())
         )
-        embed.add_field(name="👤 Usuario", value=usuario.mention, inline=True)
-        embed.add_field(name="⏱️ Duración", value=f"{minutos} minutos", inline=True)
-        embed.add_field(name="📝 Razón", value=razon, inline=False)
-        embed.add_field(name="🛡️ Moderador", value=interaction.user.mention, inline=True)
-        await interaction.response.send_message(embed=embed)
-    except discord.Forbidden:
-        await interaction.response.send_message("❌ No puedo silenciar a ese usuario.", ephemeral=True)
-
-# ==========================================
-# COMANDO — /dessilenciar (admin)
-# ==========================================
-@bot.tree.command(name="dessilenciar", description="🔊 Quita el silencio a un usuario (solo admins)")
-@app_commands.describe(usuario="Usuario a dessilenciar")
-async def dessilenciar(interaction: discord.Interaction, usuario: discord.Member):
-    if not interaction.user.guild_permissions.moderate_members:
-        return await interaction.response.send_message("❌ No tienes permisos.", ephemeral=True)
-    try:
-        await usuario.timeout(None)
-        embed = discord.Embed(
-            title="🔊 Silencio retirado",
-            description=f"{usuario.mention} ya puede hablar de nuevo.",
-            color=0x00ff88,
-            timestamp=datetime.now()
+    else:
+        await interaction.response.send_message(
+            embed=discord.Embed(title="❌ No hay nada pausado", color=0xff4444), ephemeral=True
         )
-        await interaction.response.send_message(embed=embed)
-    except discord.Forbidden:
-        await interaction.response.send_message("❌ No puedo modificar a ese usuario.", ephemeral=True)
 
-# ==========================================
-# COMANDO — /protecciones (admin)
-# ==========================================
-@bot.tree.command(name="protecciones", description="📊 Lista todas las protecciones activas del servidor (admins)")
-async def protecciones(interaction: discord.Interaction):
-    if not interaction.user.guild_permissions.administrator:
-        return await interaction.response.send_message("❌ Solo administradores.", ephemeral=True)
-    guild_rules = ping_rules.get(interaction.guild_id, {})
-    if not guild_rules:
+
+@bot.tree.command(name="stop", description="⏹️ Para la música y desconecta el bot")
+async def stop(interaction: discord.Interaction):
+    vc = interaction.guild.voice_client
+    gp = get_player(interaction.guild_id)
+    if vc:
+        gp.queue.clear()
+        gp.current = None
+        vc.stop()
+        await vc.disconnect()
+        await interaction.response.send_message(
+            embed=discord.Embed(
+                title="⏹️ Detenido",
+                description="Cola limpiada y bot desconectado.",
+                color=0xff4444,
+                timestamp=datetime.now()
+            )
+        )
+    else:
+        await interaction.response.send_message(
+            embed=discord.Embed(title="❌ No estoy en ningún canal", color=0xff4444), ephemeral=True
+        )
+
+
+@bot.tree.command(name="queue", description="📋 Muestra la cola de reproducción")
+async def queue_cmd(interaction: discord.Interaction):
+    gp = get_player(interaction.guild_id)
+    if not gp.current and not gp.queue:
         return await interaction.response.send_message(
-            embed=discord.Embed(title="📊 Protecciones", description="No hay protecciones activas.", color=0xffaa00),
-            ephemeral=True
+            embed=discord.Embed(title="📋 Cola vacía", description="Usa `/play` para añadir música.", color=0x5865F2)
         )
-    labels = {"nothing": "✅ Nada", "warn": "⚠️ Advertir", "mute": "🔇 Silenciar", "ban": "🔨 Ban"}
+
     desc = ""
-    for victim_id, rule in guild_rules.items():
-        protected = rule["protected_users"]
-        prot_text = "Todos" if not protected else f"{len(protected)} usuario(s)"
-        desc += f"<@{victim_id}> → **{labels[rule['action']]}** · Aplica a: {prot_text}\n"
-    embed = discord.Embed(title="📊 Protecciones activas", description=desc, color=0x5865F2, timestamp=datetime.now())
-    await interaction.response.send_message(embed=embed, ephemeral=True)
+    if gp.current:
+        dur = format_duration(gp.current.get('duration', 0))
+        desc += f"**▶️ Sonando ahora:**\n[{gp.current['title'][:55]}]({gp.current['url']}) `{dur}`\n\n"
+
+    if gp.queue:
+        desc += "**📋 Siguiente en cola:**\n"
+        for i, t in enumerate(gp.queue[:10]):
+            dur = format_duration(t.get('duration', 0))
+            desc += f"**{i+1}.** {t['title'][:50]} `{dur}`\n"
+        if len(gp.queue) > 10:
+            desc += f"\n*...y {len(gp.queue)-10} canciones más*"
+
+    embed = discord.Embed(title="📋 Cola de reproducción", description=desc, color=0x5865F2, timestamp=datetime.now())
+    embed.set_footer(text=f"FLEXUS MUSIC  •  {len(gp.queue)} canciones en cola  •  Loop: {'✅' if gp.loop else '❌'}")
+    await interaction.response.send_message(embed=embed)
+
+
+@bot.tree.command(name="nowplaying", description="🎵 Muestra la canción que está sonando")
+async def nowplaying(interaction: discord.Interaction):
+    gp = get_player(interaction.guild_id)
+    if not gp.current:
+        return await interaction.response.send_message(
+            embed=discord.Embed(title="❌ Nada reproduciéndose", color=0xff4444), ephemeral=True
+        )
+    await interaction.response.send_message(embed=now_playing_embed(gp.current, gp))
+
+
+@bot.tree.command(name="volume", description="🔊 Ajusta el volumen (1-200)")
+@app_commands.describe(nivel="Nivel de volumen entre 1 y 200")
+async def volume(interaction: discord.Interaction, nivel: int):
+    if not 1 <= nivel <= 200:
+        return await interaction.response.send_message(
+            embed=discord.Embed(title="❌ Volumen inválido", description="Elige entre 1 y 200.", color=0xff4444), ephemeral=True
+        )
+    gp = get_player(interaction.guild_id)
+    gp.volume = nivel / 100
+    vc = interaction.guild.voice_client
+    if vc and vc.source:
+        vc.source.volume = gp.volume
+    bar_filled = int((nivel / 200) * 20)
+    bar = "█" * bar_filled + "░" * (20 - bar_filled)
+    embed = discord.Embed(
+        title="🔊 Volumen ajustado",
+        description=f"`{bar}` **{nivel}%**",
+        color=0x1DB954,
+        timestamp=datetime.now()
+    )
+    await interaction.response.send_message(embed=embed)
+
+
+@bot.tree.command(name="loop", description="🔁 Activa o desactiva el modo loop")
+async def loop(interaction: discord.Interaction):
+    gp = get_player(interaction.guild_id)
+    gp.loop = not gp.loop
+    status = "✅ Activado" if gp.loop else "❌ Desactivado"
+    embed = discord.Embed(
+        title=f"🔁 Loop {status}",
+        description="La canción actual se repetirá." if gp.loop else "La canción no se repetirá.",
+        color=0x1DB954 if gp.loop else 0xff4444,
+        timestamp=datetime.now()
+    )
+    await interaction.response.send_message(embed=embed)
+
+
+@bot.tree.command(name="clear", description="🗑️ Limpia la cola de reproducción")
+async def clear(interaction: discord.Interaction):
+    gp = get_player(interaction.guild_id)
+    count = len(gp.queue)
+    gp.queue.clear()
+    embed = discord.Embed(
+        title="🗑️ Cola limpiada",
+        description=f"Se eliminaron **{count}** canciones de la cola.",
+        color=0xffaa00,
+        timestamp=datetime.now()
+    )
+    await interaction.response.send_message(embed=embed)
+
 
 # ==========================================
-# EVENTO ON_READY
+# EVENTOS
 # ==========================================
 @bot.event
 async def on_ready():
     await bot.tree.sync()
-    print(f"✅ {bot.user} conectado y listo.")
+    print(f"✅ {bot.user} conectado — FLEXUS MUSIC listo")
     await bot.change_presence(activity=discord.Activity(
-        type=discord.ActivityType.watching, name="los pings del servidor 🛡️"
+        type=discord.ActivityType.listening, name="/play  •  FLEXUS"
     ))
+
+@bot.event
+async def on_voice_state_update(member, before, after):
+    """Desconectar si el bot se queda solo."""
+    if member.bot:
+        return
+    guild = member.guild
+    vc = guild.voice_client
+    if vc and len(vc.channel.members) == 1:
+        await asyncio.sleep(30)
+        vc = guild.voice_client
+        if vc and len(vc.channel.members) == 1:
+            gp = get_player(guild.id)
+            gp.queue.clear()
+            gp.current = None
+            await vc.disconnect()
 
 # ==========================================
 # INICIO
@@ -447,4 +558,4 @@ if __name__ == "__main__":
     if TOKEN:
         bot.run(TOKEN)
     else:
-        print("❌ Falta DISCORD_TOKEN")
+        print("❌ Falta DISCORD_TOKEN en las variables de entorno.")
