@@ -1,7 +1,2 @@
-discord.py
+discord.py[voice]
 yt-dlp
-motor
-PyNaCl
-flask
-flask-cors
-aiohttp
